@@ -1,25 +1,26 @@
-package org.springframework.context.debug;
+package org.springframework.context;
 
+import org.junit.jupiter.api.Test;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.stereotype.Component;
 
 /**
  * A minimal Spring application to debug the startup process.
  * <p>
- * Usage: Run the main method and set breakpoints in:
+ * Usage: Run the debugStartup test and set breakpoints in:
  * <ul>
  *     <li>{@link org.springframework.context.support.AbstractApplicationContext#refresh()}</li>
  *     <li>{@link org.springframework.beans.factory.support.DefaultSingletonBeanRegistry#getSingleton(String, boolean)}</li>
  *     <li>{@link org.springframework.aop.framework.JdkDynamicAopProxy#invoke(Object, java.lang.reflect.Method, Object[])}</li>
  * </ul>
  */
-public class MinimalSpringApp {
+class ContextStartupTests {
 
-	public static void main(String[] args) {
+	@Test
+	void debugStartup() {
 		System.out.println(">>> Spring Application Starting...");
 		AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(AppConfig.class);
 		
