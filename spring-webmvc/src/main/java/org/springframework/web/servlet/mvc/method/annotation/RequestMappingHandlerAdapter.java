@@ -885,57 +885,145 @@ public class RequestMappingHandlerAdapter extends AbstractHandlerMethodAdapter
 	protected @Nullable ModelAndView invokeHandlerMethod(HttpServletRequest request,
 			HttpServletResponse response, HandlerMethod handlerMethod) throws Exception {
 
+		// ---------------------------------------------------------
+		// 1. 异步请求处理 (Async Handling) 初始化
+		// ---------------------------------------------------------
+
+		// 获取 WebAsyncManager，它是 Spring MVC 处理异步请求（如返回 Callable, DeferredResult）的核心管理器
 		WebAsyncManager asyncManager = WebAsyncUtils.getAsyncManager(request);
+
+		// 创建 AsyncWebRequest，它是对原生 Request/Response 的封装，用于异步场景
 		AsyncWebRequest asyncWebRequest = WebAsyncUtils.createAsyncWebRequest(request, response);
+		// 设置异步超时时间
 		asyncWebRequest.setTimeout(this.asyncRequestTimeout);
 
+		// 将 TaskExecutor（线程池）配置给异步管理器，用于执行 Callable 等任务
 		asyncManager.setTaskExecutor(this.taskExecutor);
 		asyncManager.setAsyncWebRequest(asyncWebRequest);
+		// 注册异步拦截器 (CallableProcessingInterceptor, DeferredResultProcessingInterceptor)
 		asyncManager.registerCallableInterceptors(this.callableInterceptors);
 		asyncManager.registerDeferredResultInterceptors(this.deferredResultInterceptors);
 
 		// Obtain wrapped response to enforce lifecycle rule from Servlet spec, section 2.3.3.4
+		// 获取被包装的原生 Response，以确保遵循 Servlet 规范 (Lifecycle rule)
 		response = asyncWebRequest.getNativeResponse(HttpServletResponse.class);
 
+		// 再次封装 Request，ServletWebRequest 提供了很多方便的方法（如 checkNotModified）
 		ServletWebRequest webRequest = (asyncWebRequest instanceof ServletWebRequest ?
 				(ServletWebRequest) asyncWebRequest : new ServletWebRequest(request, response));
 
+
+		// ---------------------------------------------------------
+		// 2. 核心组件工厂准备
+		// ---------------------------------------------------------
+
+		// 创建 WebDataBinderFactory
+		// 它的作用是创建 DataBinder，负责将请求参数绑定到 Java 对象，并进行类型转换
+		// 它会扫描 Controller 中的 @InitBinder 方法
 		WebDataBinderFactory binderFactory = getDataBinderFactory(handlerMethod);
+
+		// 创建 ModelFactory
+		// 它的作用是处理 @ModelAttribute 注解的方法，在目标方法执行前初始化 Model 数据
 		ModelFactory modelFactory = getModelFactory(handlerMethod, binderFactory);
 
+
+		// ---------------------------------------------------------
+		// 3. 创建“可执行”的方法对象 (Key Object)
+		// ---------------------------------------------------------
+
+		// ServletInvocableHandlerMethod 是 HandlerMethod 的子类
+		// 它不仅知道调用哪个方法，还具备了“调用能力”（Invoke）和“参数/返回值处理能力”
 		ServletInvocableHandlerMethod invocableMethod = createInvocableHandlerMethod(handlerMethod);
+
+		// 注入参数解析器 (ArgumentResolvers)
+		// 比如解析 @RequestParam, @RequestBody, @PathVariable 等
 		if (this.argumentResolvers != null) {
 			invocableMethod.setHandlerMethodArgumentResolvers(this.argumentResolvers);
 		}
+
+		// 注入返回值处理器 (ReturnValueHandlers)
+		// 比如处理 @ResponseBody, 返回 View 字符串, 返回 ModelAndView 等
 		if (this.returnValueHandlers != null) {
 			invocableMethod.setHandlerMethodReturnValueHandlers(this.returnValueHandlers);
 		}
+
+		// 注入数据绑定工厂和参数名发现器
 		invocableMethod.setDataBinderFactory(binderFactory);
 		invocableMethod.setParameterNameDiscoverer(this.parameterNameDiscoverer);
+		// 注入方法验证器 (用于 @Valid / @Validated 参数校验)
 		invocableMethod.setMethodValidator(this.methodValidator);
 
+
+		// ---------------------------------------------------------
+		// 4. 上下文容器与模型初始化
+		// ---------------------------------------------------------
+
+		// 创建 ModelAndViewContainer
+		// 这是一个非常重要的容器，它贯穿整个执行过程，用来存储 Model 数据和 View 名称
 		ModelAndViewContainer mavContainer = new ModelAndViewContainer();
+
+		// 将 FlashMap 中的属性（重定向时传递的参数）添加到容器中
 		mavContainer.addAllAttributes(RequestContextUtils.getInputFlashMap(request));
+
+		// 初始化 Model
+		// 这里会执行所有 @ModelAttribute 标记的方法，并将数据放入 mavContainer
 		modelFactory.initModel(webRequest, mavContainer, invocableMethod);
 
+
+		// ---------------------------------------------------------
+		// 5. 异步请求的“恢复”逻辑 (Resume)
+		// ---------------------------------------------------------
+
+		// 如果当前请求是异步请求的“恢复”阶段（即异步任务已经执行完毕，重新分发回来的请求）
 		if (asyncManager.hasConcurrentResult()) {
+			// 获取异步执行的结果
 			Object result = asyncManager.getConcurrentResult();
+			// 获取之前的上下文（因为是同一个请求的第二次进入，需要恢复之前的 mavContainer）
 			Object[] resultContext = asyncManager.getConcurrentResultContext();
 			Assert.state(resultContext != null && resultContext.length > 0, "Missing result context");
+
+			// 恢复之前的 mavContainer
 			mavContainer = (ModelAndViewContainer) resultContext[0];
+
+			// 清除结果，避免重复处理
 			asyncManager.clearConcurrentResult();
+
+			// 打印日志
 			LogFormatUtils.traceDebug(logger, traceOn -> {
 				String formatted = LogFormatUtils.formatValue(result, !traceOn);
 				return "Resume with async result [" + formatted + "]";
 			});
+
+			// 【关键】将 invocableMethod 包装一下
+			// 此时不需要再执行 Controller 的方法了，而是直接把异步结果（result）作为返回值
+			// 这样后续的 invokeAndHandle 就会直接处理这个 result
 			invocableMethod = invocableMethod.wrapConcurrentResult(result);
 		}
 
+
+		// ---------------------------------------------------------
+		// 6. 真正的执行阶段
+		// ---------------------------------------------------------
+
+		// 【核心入口】触发 Controller 方法的调用
+		// 1. 解析参数 (resolve arguments)
+		// 2. 反射调用 (invoke)
+		// 3. 处理返回值 (handle return value) -> 比如 @ResponseBody 在这里就写入 Response 了
 		invocableMethod.invokeAndHandle(webRequest, mavContainer);
+
+
+		// ---------------------------------------------------------
+		// 7. 处理执行结果
+		// ---------------------------------------------------------
+
+		// 如果在执行过程中开启了异步处理（例如 Controller 返回了 Callable 或 DeferredResult）
 		if (asyncManager.isConcurrentHandlingStarted()) {
+			// 直接返回 null
+			// 因为响应会由异步线程稍后处理，或者等待请求再次被分发回来（Resume）
 			return null;
 		}
 
+		// 将 mavContainer 中的数据和视图名，封装成标准的 ModelAndView 对象返回
 		return getModelAndView(mavContainer, modelFactory, webRequest);
 	}
 

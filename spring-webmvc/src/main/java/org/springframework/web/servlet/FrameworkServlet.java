@@ -870,7 +870,11 @@ public abstract class FrameworkServlet extends HttpServletBean implements Applic
 	protected void service(HttpServletRequest request, HttpServletResponse response)
 			throws ServletException, IOException {
 
+		// 1. 判断：这是不是父类 HttpServlet 认识的方法？(GET, POST, PUT 等)
 		if (HTTP_SERVLET_METHODS.contains(request.getMethod())) {
+			// 2. 调用父类 HttpServlet.service() -> 分发给 doGet/doPost...
+			// 复用了 HttpServlet 对 HEAD、OPTIONS、TRACE 等方法的标准处理逻辑。
+			// -> 最终回到 FrameworkServlet 重写的 doGet/doPost -> processRequest
 			super.service(request, response);
 		}
 		else {

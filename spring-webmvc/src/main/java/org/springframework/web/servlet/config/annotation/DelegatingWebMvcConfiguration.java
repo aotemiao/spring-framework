@@ -45,6 +45,9 @@ import org.springframework.web.servlet.HandlerExceptionResolver;
 @Configuration(proxyBeanMethods = false)
 public class DelegatingWebMvcConfiguration extends WebMvcConfigurationSupport {
 
+	// 1. 【收集】
+	// Spring 会自动把容器里所有实现了 WebMvcConfigurer 接口的 Bean 都注入进来
+	// 这就是为什么你写个配置类实现 WebMvcConfigurer 就能生效的原因
 	private final WebMvcConfigurerComposite configurers = new WebMvcConfigurerComposite();
 
 
@@ -86,6 +89,8 @@ public class DelegatingWebMvcConfiguration extends WebMvcConfigurationSupport {
 		this.configurers.addFormatters(registry);
 	}
 
+	// 2. 【委派】
+	// 重写父类的方法，把具体的定制逻辑“委派”给 configurers
 	@Override
 	protected void addInterceptors(InterceptorRegistry registry) {
 		this.configurers.addInterceptors(registry);

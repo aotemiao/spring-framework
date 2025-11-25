@@ -426,13 +426,26 @@ public class ExceptionHandlerExceptionResolver extends AbstractHandlerMethodExce
 	protected @Nullable ModelAndView doResolveHandlerMethodException(HttpServletRequest request,
 			HttpServletResponse response, @Nullable HandlerMethod handlerMethod, Exception exception) {
 
+		// 1. 包装 Request
 		ServletWebRequest webRequest = new ServletWebRequest(request, response);
+
+		// 2. 【核心步骤】寻找合适的 @ExceptionHandler 方法
+		// 这个方法非常智能，它会按以下顺序寻找：
+		// a. 当前抛出异常的 Controller 类内部定义的 @ExceptionHandler
+		// b. 全局 @ControllerAdvice 定义的 @ExceptionHandler
+		// c. 匹配规则：找那个能够处理 exception 类型（或其父类）的方法
 		ServletInvocableHandlerMethod exceptionHandlerMethod = getExceptionHandlerMethod(handlerMethod, exception, webRequest);
 
+		// 如果找不到能处理这个异常的方法，直接返回 null
+		// 这会让 DispatcherServlet 继续尝试下一个 HandlerExceptionResolver (责任链模式)
 		if (exceptionHandlerMethod == null) {
 			return null;
 		}
 
+		// 3. 配置执行器
+		// 给找到的异常处理方法注入“工具箱”：
+		// a. ArgumentResolvers: 为了能解析 @ExceptionHandler 方法的参数 (如 Exception e, HttpServletRequest req)
+		// b. ReturnValueHandlers: 为了能处理返回值 (如 @ResponseBody ResponseEntity, String viewName)
 		if (this.argumentResolvers != null) {
 			exceptionHandlerMethod.setHandlerMethodArgumentResolvers(this.argumentResolvers);
 		}
@@ -440,49 +453,78 @@ public class ExceptionHandlerExceptionResolver extends AbstractHandlerMethodExce
 			exceptionHandlerMethod.setHandlerMethodReturnValueHandlers(this.returnValueHandlers);
 		}
 
+		// 4. 准备上下文容器
+		// 用于存储执行过程中产生的 Model 数据和 View 名称
 		ModelAndViewContainer mavContainer = new ModelAndViewContainer();
 
+		// 5. 准备异常链参数
+		// 这段逻辑是为了让 @ExceptionHandler 方法的参数不仅可以接收当前异常，
+		// 还可以接收异常链中的 Cause (虽然平时很少这么用)。
 		ArrayList<Throwable> exceptions = new ArrayList<>();
 		try {
 			if (logger.isDebugEnabled()) {
 				logger.debug("Using @ExceptionHandler " + exceptionHandlerMethod);
 			}
 			// Expose causes as provided arguments as well
+			// 遍历异常链，将所有 Cause 收集起来
 			Throwable exToExpose = exception;
 			while (exToExpose != null) {
 				exceptions.add(exToExpose);
 				Throwable cause = exToExpose.getCause();
 				exToExpose = (cause != exToExpose ? cause : null);
 			}
+
+			// 将异常链作为 providedArgs (预设参数) 传入
+			// 这样 ArgumentResolver 在解析参数时，如果发现参数类型匹配这些异常，就可以直接注入
 			@Nullable Object[] arguments = new Object[exceptions.size() + 1];
 			exceptions.toArray(arguments);  // efficient arraycopy call in ArrayList
+			// 同时也把原始的 handlerMethod 传进去
 			arguments[arguments.length - 1] = handlerMethod;
+
+			// 6. 【关键调用】执行 @ExceptionHandler 方法
+			// 这里的逻辑和 Controller 方法执行一模一样：解析参数 -> 反射调用 -> 处理返回值
 			exceptionHandlerMethod.invokeAndHandle(webRequest, mavContainer, arguments);
 		}
 		catch (Throwable invocationEx) {
+			// 7. 处理异常处理方法本身抛出的异常
+
+			// 如果是因为客户端断开连接 (ClientAbortException)，则忽略，返回空 MAV
 			if (disconnectedClientHelper.checkAndLogClientDisconnectedException(invocationEx)) {
 				return new ModelAndView();
 			}
 			// Any other than the original exception (or a cause) is unintended here,
 			// probably an accident (for example, failed assertion or the like).
+			// 如果抛出的异常不是原本那个异常 (说明是 @ExceptionHandler 代码里写崩了)
+			// 打印一条警告日志
 			if (!exceptions.contains(invocationEx) && logger.isWarnEnabled()) {
 				logger.warn("Failure in @ExceptionHandler " + exceptionHandlerMethod, invocationEx);
 			}
 			// Continue with default processing of the original exception...
+			// 返回 null，表示当前 Resolver 处理失败 (放弃治疗)，交给下一个 Resolver
+			// 注意：这意味着原始异常可能会继续向上抛出，或者由 Tomcat 的错误页处理
 			return null;
 		}
 
+		// 8. 处理执行结果 (构造 ModelAndView)
+
+		// 情况 A: 如果方法使用了 @ResponseBody 或 ResponseEntity
+		// 此时 mavContainer.isRequestHandled() 会被标记为 true (因为 JSON 已经写入 Response 流了)
 		if (mavContainer.isRequestHandled()) {
+			// 返回一个空的 ModelAndView，告诉 DispatcherServlet "完事了，不用渲染视图"
 			return new ModelAndView();
 		}
+		// 情况 B: 方法返回的是视图名称 (如 "error/500")
 		else {
+			// 从 mavContainer 提取 Model, ViewName, Status
 			ModelMap model = mavContainer.getModel();
 			HttpStatusCode status = mavContainer.getStatus();
+			// 构造最终的 ModelAndView 对象
 			ModelAndView mav = new ModelAndView(mavContainer.getViewName(), model, status);
 			mav.setViewName(mavContainer.getViewName());
 			if (!mavContainer.isViewReference()) {
 				mav.setView((View) mavContainer.getView());
 			}
+			// 处理 RedirectAttributes (重定向传参)
 			if (model instanceof RedirectAttributes redirectAttributes) {
 				Map<String, ?> flashAttributes = redirectAttributes.getFlashAttributes();
 				RequestContextUtils.getOutputFlashMap(request).putAll(flashAttributes);

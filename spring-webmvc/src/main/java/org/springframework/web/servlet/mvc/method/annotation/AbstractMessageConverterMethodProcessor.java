@@ -206,10 +206,15 @@ public abstract class AbstractMessageConverterMethodProcessor extends AbstractMe
 			ServletServerHttpRequest inputMessage, ServletServerHttpResponse outputMessage)
 			throws IOException, HttpMediaTypeNotAcceptableException, HttpMessageNotWritableException {
 
+		// ---------------------------------------------------------
+		// 1. 确定返回值的类型 (Body & Type)
+		// ---------------------------------------------------------
 		Object body;
 		Class<?> valueType;
 		Type targetType;
 
+		// 特殊处理字符串类型：
+		// 如果返回值是 CharSequence (String, StringBuilder 等)，直接当作 String 处理
 		if (value instanceof CharSequence) {
 			body = value.toString();
 			valueType = String.class;
@@ -217,45 +222,69 @@ public abstract class AbstractMessageConverterMethodProcessor extends AbstractMe
 		}
 		else {
 			body = value;
+			// 获取实际运行时的类 (如果是 null，后续逻辑会处理)
 			valueType = getReturnValueType(body, returnType);
+			// 解析泛型类型 (例如 List<User>)，这对 Jackson 正确序列化泛型集合至关重要
 			targetType = GenericTypeResolver.resolveType(getGenericType(returnType), returnType.getContainingClass());
 		}
 
+		// ---------------------------------------------------------
+		// 2. 处理资源文件的断点续传 (Range Requests)
+		// ---------------------------------------------------------
+		// 如果返回值是 Resource 类型 (如 FileSystemResource)，并且支持 InputStream
 		if (isResourceType(value, returnType)) {
+			// 告知客户端：我支持按字节范围请求 (断点续传的关键头)
 			outputMessage.getHeaders().set(HttpHeaders.ACCEPT_RANGES, "bytes");
+
+			// 如果请求头包含 "Range" (例如 Range: bytes=0-1023) 且当前状态码是 200
 			if (value != null && inputMessage.getHeaders().getFirst(HttpHeaders.RANGE) != null &&
 					outputMessage.getServletResponse().getStatus() == 200) {
 				Resource resource = (Resource) value;
 				try {
+					// 解析 Range 头
 					List<HttpRange> httpRanges = inputMessage.getHeaders().getRange();
+					// 将状态码改为 206 Partial Content
 					outputMessage.getServletResponse().setStatus(HttpStatus.PARTIAL_CONTENT.value());
+					// 将 Resource 切割成 ResourceRegion (区域片段) 作为新的 Body
 					body = HttpRange.toResourceRegions(httpRanges, resource);
 					valueType = body.getClass();
 					targetType = RESOURCE_REGION_LIST_TYPE;
 				}
 				catch (IllegalArgumentException ex) {
+					// 如果 Range 格式错误，返回 416 Requested Range Not Satisfiable
 					outputMessage.getHeaders().set(HttpHeaders.CONTENT_RANGE, "bytes */" + resource.contentLength());
 					outputMessage.getServletResponse().setStatus(HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE.value());
 				}
 			}
 		}
 
+		// ---------------------------------------------------------
+		// 3. 内容协商 (Content Negotiation) - 确定 MediaType
+		// ---------------------------------------------------------
 		MediaType selectedMediaType = null;
 		MediaType contentType = outputMessage.getHeaders().getContentType();
+		// 检查是否已经在 Response Header 中预设了 Content-Type
+		// (例如在 Controller 中手动设置了 response.setContentType("application/json"))
 		boolean isContentTypePreset = contentType != null && contentType.isConcrete();
+
 		if (isContentTypePreset) {
+			// 如果预设了，直接使用，跳过协商过程
 			if (logger.isDebugEnabled()) {
 				logger.debug("Found 'Content-Type:" + contentType + "' in response");
 			}
 			selectedMediaType = contentType;
 		}
 		else {
+			// --- 开始自动协商 ---
 			HttpServletRequest request = inputMessage.getServletRequest();
 			List<MediaType> acceptableTypes;
 			try {
+				// A. 获取客户端“想要”的类型 (读取 Accept Header)
+				// 例如: application/json, text/html
 				acceptableTypes = getAcceptableMediaTypes(request);
 			}
 			catch (HttpMediaTypeNotAcceptableException ex) {
+				// 如果 Accept 头解析失败，且是错误响应或空 Body，则忽略；否则抛出异常
 				int series = outputMessage.getServletResponse().getStatus() / 100;
 				if (body == null || series == 4 || series == 5) {
 					if (logger.isDebugEnabled()) {
@@ -266,20 +295,28 @@ public abstract class AbstractMessageConverterMethodProcessor extends AbstractMe
 				throw ex;
 			}
 
+			// B. 获取服务器“能给”的类型 (Producible Media Types)
+			// 遍历所有 MessageConverter，问它们谁能处理这个 valueType
 			List<MediaType> producibleTypes = getProducibleMediaTypes(request, valueType, targetType);
+
+			// 如果有 Body 但找不到任何能处理的 Converter，抛出异常 (500)
 			if (body != null && producibleTypes.isEmpty()) {
 				throw new HttpMessageNotWritableException(
 						"No converter found for return value of type: " + valueType);
 			}
 
+			// C. 计算交集：【想要的】 ∩ 【能给的】
 			List<MediaType> compatibleMediaTypes = new ArrayList<>();
 			determineCompatibleMediaTypes(acceptableTypes, producibleTypes, compatibleMediaTypes);
 
 			// For ProblemDetail, fall back on RFC 9457 format
+			// 特殊处理 Spring 6 的 ProblemDetail (RFC 9457 错误详情)
+			// 如果交集为空，但返回的是 ProblemDetail，尝试回退到标准错误格式
 			if (compatibleMediaTypes.isEmpty() && ProblemDetail.class.isAssignableFrom(valueType)) {
 				determineCompatibleMediaTypes(PROBLEM_MEDIA_TYPES, producibleTypes, compatibleMediaTypes);
 			}
 
+			// 如果交集为空，说明无法满足客户端要求，抛出 406 Not Acceptable
 			if (compatibleMediaTypes.isEmpty()) {
 				if (logger.isDebugEnabled()) {
 					logger.debug("No match for " + acceptableTypes + ", supported: " + producibleTypes);
@@ -290,13 +327,16 @@ public abstract class AbstractMessageConverterMethodProcessor extends AbstractMe
 				return;
 			}
 
+			// D. 排序：根据具体程度和权重排序 (Quality Value, q=0.8)
 			MimeTypeUtils.sortBySpecificity(compatibleMediaTypes);
 
+			// E. 选择最佳匹配：取排序后的第一个具体的类型
 			for (MediaType mediaType : compatibleMediaTypes) {
 				if (mediaType.isConcrete()) {
 					selectedMediaType = mediaType;
 					break;
 				}
+				// 如果匹配到的是通配符 */* 或者 application/*，默认选 application/octet-stream
 				else if (mediaType.isPresentIn(ALL_APPLICATION_MEDIA_TYPES)) {
 					selectedMediaType = MediaType.APPLICATION_OCTET_STREAM;
 					break;
@@ -309,34 +349,54 @@ public abstract class AbstractMessageConverterMethodProcessor extends AbstractMe
 			}
 		}
 
+		// ---------------------------------------------------------
+		// 4. 选择 Converter 并写入 (Write)
+		// ---------------------------------------------------------
 		if (selectedMediaType != null) {
+			// 移除 quality value (例如 application/json;q=0.8 -> application/json)
 			selectedMediaType = selectedMediaType.removeQualityValue();
 
 			ResolvableType targetResolvableType = null;
+
+			// 再次遍历所有的 Converter，找到那个能用 selectedMediaType 写入 valueType 的人
 			for (HttpMessageConverter converter : this.messageConverters) {
 				ConverterType converterTypeToUse = null;
+
+				// 判断 Converter 类型并检查 canWrite 能力
 				if (converter instanceof GenericHttpMessageConverter genericConverter) {
+					// 泛型 Converter (如 Jackson)
 					if (genericConverter.canWrite(targetType, valueType, selectedMediaType)) {
 						converterTypeToUse = ConverterType.GENERIC;
 					}
 				}
 				else if (converter instanceof SmartHttpMessageConverter smartConverter) {
+					// 智能 Converter
 					targetResolvableType = getNestedTypeIfNeeded(ResolvableType.forType(targetType));
 					if (smartConverter.canWrite(targetResolvableType, valueType, selectedMediaType)) {
 						converterTypeToUse = ConverterType.SMART;
 					}
 				}
 				else if (converter.canWrite(valueType, selectedMediaType)){
+					// 普通 Converter
 					converterTypeToUse = ConverterType.BASE;
 				}
+
+				// 找到了合适的 Converter！
 				if (converterTypeToUse != null) {
+					// A. 执行 ResponseBodyAdvice 的 beforeBodyWrite 方法
+					// 这是一个重要的扩展点！允许用户在写入前修改 Body (例如统一包装 Result<T>)
 					body = getAdvice().beforeBodyWrite(body, returnType, selectedMediaType,
 							(Class<? extends HttpMessageConverter<?>>) converter.getClass(), inputMessage, outputMessage);
+
 					if (body != null) {
 						Object theBody = body;
 						LogFormatUtils.traceDebug(logger, traceOn ->
 								"Writing [" + LogFormatUtils.formatValue(theBody, !traceOn) + "]");
+
+						// 添加 Content-Disposition 头 (如果是下载文件)
 						addContentDispositionHeader(inputMessage, outputMessage);
+
+						// B. 【核心动作】执行写入
 						switch (converterTypeToUse) {
 							case BASE -> converter.write(body, selectedMediaType, outputMessage);
 							case GENERIC -> ((GenericHttpMessageConverter) converter).write(body, targetType, selectedMediaType, outputMessage);
@@ -350,20 +410,27 @@ public abstract class AbstractMessageConverterMethodProcessor extends AbstractMe
 							logger.debug("Nothing to write: null body");
 						}
 					}
+					// 写入完成，直接返回
 					return;
 				}
 			}
 		}
 
+		// ---------------------------------------------------------
+		// 5. 错误兜底
+		// ---------------------------------------------------------
+		// 如果 Body 不为空，但代码走到这里，说明没找到 Converter 或者协商失败
 		if (body != null) {
 			Set<MediaType> producibleMediaTypes =
 					(Set<MediaType>) inputMessage.getServletRequest()
 							.getAttribute(HandlerMapping.PRODUCIBLE_MEDIA_TYPES_ATTRIBUTE);
 
+			// 如果 Content-Type 是预设的，但找不到 Converter，抛 500
 			if (isContentTypePreset || !CollectionUtils.isEmpty(producibleMediaTypes)) {
 				throw new HttpMessageNotWritableException(
 						"No converter for [" + valueType + "] with preset Content-Type '" + contentType + "'");
 			}
+			// 否则抛 406 Not Acceptable
 			throw new HttpMediaTypeNotAcceptableException(getSupportedMediaTypes(body.getClass()));
 		}
 	}

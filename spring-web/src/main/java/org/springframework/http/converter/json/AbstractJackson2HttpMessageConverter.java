@@ -96,6 +96,7 @@ public abstract class AbstractJackson2HttpMessageConverter extends AbstractGener
 	}
 
 
+	// 核心对象
 	protected ObjectMapper defaultObjectMapper;
 
 	private @Nullable Map<Class<?>, Map<MediaType, ObjectMapper>> objectMapperRegistrations;
@@ -360,7 +361,9 @@ public abstract class AbstractJackson2HttpMessageConverter extends AbstractGener
 	protected Object readInternal(Class<?> clazz, HttpInputMessage inputMessage)
 			throws IOException, HttpMessageNotReadableException {
 
+		// 1. 构建 Jackson 的类型描述 (JavaType)
 		JavaType javaType = getJavaType(clazz, null);
+		// 2. 调用核心读取方法
 		return readJavaType(javaType, inputMessage);
 	}
 
@@ -375,28 +378,59 @@ public abstract class AbstractJackson2HttpMessageConverter extends AbstractGener
 				"UTF-16".equals(charset.name()) ||
 				"UTF-32".equals(charset.name());
 		try {
+			// 1. 准备输入流 (Input Stream)
+			// 获取 HTTP 请求的原始 InputStream。
+			// StreamUtils.nonClosing() 是一个保护措施，防止 Jackson 在读取完毕后自动关闭流。
+			// 因为 Servlet 容器通常希望自己管理流的生命周期，而不是由转换器关闭。
 			InputStream inputStream = StreamUtils.nonClosing(inputMessage.getBody());
+
+			// 2. 处理 @JsonView 场景 (反序列化视图)
+			// 如果当前的 InputMessage 是 MappingJacksonInputMessage 类型，说明它携带了 View 信息。
+			// @JsonView 允许你控制只有特定分组的字段才会被反序列化。
 			if (inputMessage instanceof MappingJacksonInputMessage mappingJacksonInputMessage) {
+				// 获取指定的视图类 (例如: interface User.Basic {})
 				Class<?> deserializationView = mappingJacksonInputMessage.getDeserializationView();
+
 				if (deserializationView != null) {
+					// 创建一个带有 View 配置的 ObjectReader
+					// objectMapper.readerWithView(...) 告诉 Jackson 只处理该 View 包含的字段
+					// .forType(javaType) 指定目标对象的类型 (例如 User.class)
 					ObjectReader objectReader = objectMapper.readerWithView(deserializationView).forType(javaType);
+
+					// 允许子类进一步自定义 Reader (扩展点)
 					objectReader = customizeReader(objectReader, javaType);
+
+					// 执行读取
 					if (isUnicode) {
+						// 场景 A: 编码是 Unicode (UTF-8/16/32)
+						// Jackson 原生对 Unicode 支持极好，直接传入 InputStream 效率最高，
+						// Jackson 内部会自动检测 BOM 和具体编码。
 						return objectReader.readValue(inputStream);
 					}
 					else {
+						// 场景 B: 编码是非 Unicode (如 ISO-8859-1)
+						// 需要手动包装成 InputStreamReader 并指定 Charset，将字节流转换为字符流
 						Reader reader = new InputStreamReader(inputStream, charset);
 						return objectReader.readValue(reader);
 					}
 				}
 			}
 
+			// 3. 处理标准场景 (无 @JsonView)
+			// 创建一个标准的 ObjectReader，用于将 JSON 转换为指定的 javaType
 			ObjectReader objectReader = objectMapper.reader().forType(javaType);
+
+			// 允许子类进一步自定义 Reader
 			objectReader = customizeReader(objectReader, javaType);
+
+			// 4. 执行读取 (核心反序列化)
 			if (isUnicode) {
+				// 优化路径：如果是 UTF-8 等 Unicode 编码，直接给 Jackson 字节流
+				// 这是目前绝大多数 Web 请求走的路径 (application/json 默认就是 UTF-8)
 				return objectReader.readValue(inputStream);
 			}
 			else {
+				// 兼容路径：非 Unicode 编码，手动转字符流再给 Jackson
 				Reader reader = new InputStreamReader(inputStream, charset);
 				return objectReader.readValue(reader);
 			}
@@ -442,55 +476,94 @@ public abstract class AbstractJackson2HttpMessageConverter extends AbstractGener
 	protected void writeInternal(Object object, @Nullable Type type, HttpOutputMessage outputMessage)
 			throws IOException, HttpMessageNotWritableException {
 
+		// 1. 确定编码格式
+		// 从响应头中获取 Content-Type (如 application/json)，并确定字符集编码 (默认 UTF-8)。
 		MediaType contentType = outputMessage.getHeaders().getContentType();
 		JsonEncoding encoding = getJsonEncoding(contentType);
 
+		// 2. 确定要使用的 ObjectMapper
+		// 如果对象被 MappingJacksonValue 包装（用于动态设置 View/Filter），则获取内部真实的 value 类型。
+		// selectObjectMapper 允许根据类或 MediaType 选择不同的 Mapper (通常应用只有一个 Mapper)。
 		Class<?> clazz = (object instanceof MappingJacksonValue mappingJacksonValue ?
 				mappingJacksonValue.getValue().getClass() : object.getClass());
 		ObjectMapper objectMapper = selectObjectMapper(clazz, contentType);
 		Assert.state(objectMapper != null, () -> "No ObjectMapper for " + clazz.getName());
 
+		// 3. 准备输出流
+		// 使用 StreamUtils.nonClosing 包装输出流，防止 Jackson 在写入完成后自动关闭流。
+		// 流的关闭应该由 Servlet 容器（如 Tomcat）负责，而不是由 Converter 负责。
 		OutputStream outputStream = StreamUtils.nonClosing(outputMessage.getBody());
+
+		// 创建 Jackson 的底层生成器 JsonGenerator，指定编码
 		try (JsonGenerator generator = objectMapper.getFactory().createGenerator(outputStream, encoding)) {
+			// 写入前缀（主要用于 JSONP 场景，写入 callback 函数名，现代开发中很少使用）
 			writePrefix(generator, object);
 
+			// 4. 准备序列化所需的元数据
 			Object value = object;
 			Class<?> serializationView = null;
 			FilterProvider filters = null;
 			JavaType javaType = null;
 
+			// 处理 MappingJacksonValue 包装器
+			// 这种包装器通常用于在 Controller 中动态指定本次响应使用的 @JsonView 或 Filter
 			if (object instanceof MappingJacksonValue mappingJacksonValue) {
 				value = mappingJacksonValue.getValue();
 				serializationView = mappingJacksonValue.getSerializationView();
 				filters = mappingJacksonValue.getFilters();
 			}
+
+			// 处理泛型类型 (Generic Type)
+			// 如果 Controller 方法定义了泛型返回类型 (如 List<User>)，这里将其转换为 Jackson 的 JavaType。
+			// 这对于正确序列化集合内部的泛型对象至关重要。
 			if (type != null && TypeUtils.isAssignable(type, value.getClass())) {
 				javaType = getJavaType(type, null);
 			}
 
+			// 5. 构建 ObjectWriter (实际执行序列化的对象)
+			// 如果存在 @JsonView 配置，创建带有视图支持的 Writer；否则创建默认 Writer。
 			ObjectWriter objectWriter = (serializationView != null ?
 					objectMapper.writerWithView(serializationView) : objectMapper.writer());
+
+			// 应用动态过滤器 (如果有)
 			if (filters != null) {
 				objectWriter = objectWriter.with(filters);
 			}
+
+			// 绑定泛型类型信息
+			// 对于容器类型 (List, Map) 或 Optional，显式指定泛型类型，
+			// 防止类型擦除导致 Jackson 将其识别为 LinkedHashMap 而不是具体的 POJO。
 			if (javaType != null && (javaType.isContainerType() || javaType.isTypeOrSubTypeOf(Optional.class))) {
 				objectWriter = objectWriter.forType(javaType);
 			}
+
+			// 6. SSE (Server-Sent Events) 特殊处理
+			// 如果是文本事件流且开启了缩进输出，使用特定的 PrettyPrinter，
+			// 以避免换行符破坏 SSE 协议的格式。
 			SerializationConfig config = objectWriter.getConfig();
 			if (contentType != null && contentType.isCompatibleWith(MediaType.TEXT_EVENT_STREAM) &&
 					config.isEnabled(SerializationFeature.INDENT_OUTPUT)) {
 				objectWriter = objectWriter.with(this.ssePrettyPrinter);
 			}
+
+			// 允许子类最后一次自定义 Writer
 			objectWriter = customizeWriter(objectWriter, javaType, contentType);
+
+			// 7. 【核心执行】将 Java 对象序列化为 JSON 并写入 Generator
 			objectWriter.writeValue(generator, value);
 
+			// 写入后缀 (配合 JSONP 前缀)
 			writeSuffix(generator, object);
+
+			// 刷新缓冲区，确保数据写入网络流
 			generator.flush();
 		}
 		catch (InvalidDefinitionException ex) {
+			// 处理类型定义错误 (如缺少序列化器、无限递归等)
 			throw new HttpMessageConversionException("Type definition error: " + ex.getType(), ex);
 		}
 		catch (JsonProcessingException ex) {
+			// 处理一般的 JSON 处理错误，包装为 Spring 的异常
 			throw new HttpMessageNotWritableException("Could not write JSON: " + ex.getOriginalMessage(), ex);
 		}
 	}

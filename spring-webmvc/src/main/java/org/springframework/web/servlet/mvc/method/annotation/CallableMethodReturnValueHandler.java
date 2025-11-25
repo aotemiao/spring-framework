@@ -48,7 +48,9 @@ public class CallableMethodReturnValueHandler implements HandlerMethodReturnValu
 			return;
 		}
 
+		// 1. 拿到你 Controller 返回的那个 Callable 对象
 		Callable<?> callable = (Callable<?>) returnValue;
+		// 2. 拿到异步管理器，开始进行异步处理
 		WebAsyncUtils.getAsyncManager(webRequest).startCallableProcessing(callable, mavContainer);
 	}
 

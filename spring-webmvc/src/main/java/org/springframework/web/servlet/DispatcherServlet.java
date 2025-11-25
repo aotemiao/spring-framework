@@ -439,13 +439,21 @@ public class DispatcherServlet extends FrameworkServlet {
 	 * <p>May be overridden in subclasses in order to initialize further strategy objects.
 	 */
 	protected void initStrategies(ApplicationContext context) {
+		// 初始化 MultipartResolver，用于解析 multipart 类型请求（如文件上传）
 		initMultipartResolver(context);
+		// 初始化 LocaleResolver，用于解析当前请求的区域信息（国际化支持）
 		initLocaleResolver(context);
+		// 初始化 HandlerMapping，负责根据 Request 寻找对应的 HandlerExecutionChain（包含 Handler 和 Interceptors）
 		initHandlerMappings(context);
+		// 初始化 HandlerAdapter，负责适配并执行具体的 Handler（如调用 Controller 方法）
 		initHandlerAdapters(context);
+		// 初始化 HandlerExceptionResolver，负责解析和处理 DispatcherServlet 流程中抛出的异常
 		initHandlerExceptionResolvers(context);
+		// 初始化 RequestToViewNameTranslator，当 Handler 没有返回显式视图名称时，根据请求推断默认视图名
 		initRequestToViewNameTranslator(context);
+		// 初始化 ViewResolver，负责将逻辑视图名称（String）解析为具体的 View 渲染对象
 		initViewResolvers(context);
+		// 初始化 FlashMapManager，用于管理 Redirect 转发时的 Flash 属性（临时存储数据）
 		initFlashMapManager(context);
 	}
 
@@ -827,16 +835,23 @@ public class DispatcherServlet extends FrameworkServlet {
 	 */
 	@Override
 	protected void doService(HttpServletRequest request, HttpServletResponse response) throws Exception {
+		// 1. 日志记录
+		// 根据日志级别配置，记录当前请求的调试信息。
 		logRequest(request);
 
 		// Keep a snapshot of the request attributes in case of an include,
 		// to be able to restore the original attributes after the include.
+		// 2. 处理 Servlet "Include" 请求的属性快照
+		// 检查当前请求是否是通过 RequestDispatcher.include() 调用的。
+		// 如果是 include 请求，为了防止当前 DispatcherServlet 的处理逻辑污染外部请求（Caller）的属性，
+		// 需要对现有的 Request 属性进行快照（Snapshot）保存，以便在 finally 块中进行状态恢复。
 		Map<String, Object> attributesSnapshot = null;
 		if (WebUtils.isIncludeRequest(request)) {
 			attributesSnapshot = new HashMap<>();
 			Enumeration<?> attrNames = request.getAttributeNames();
 			while (attrNames.hasMoreElements()) {
 				String attrName = (String) attrNames.nextElement();
+				// 仅保存配置了清理策略的属性，或 Spring 框架内部定义的默认策略属性
 				if (this.cleanupAfterInclude || attrName.startsWith(DEFAULT_STRATEGIES_PREFIX)) {
 					attributesSnapshot.put(attrName, request.getAttribute(attrName));
 				}
@@ -844,18 +859,30 @@ public class DispatcherServlet extends FrameworkServlet {
 		}
 
 		// Make framework objects available to handlers and view objects.
+		// 3. 暴露框架核心组件至 Request 属性
+		// 将 Spring 的 WebApplicationContext（容器上下文）和 LocaleResolver（国际化解析器）
+		// 绑定到 HttpServletRequest 的属性中。
+		// 这使得后续的 Handler（处理器）、View（视图）或过滤器可以通过 Request 对象直接获取 Spring 容器实例和区域信息。
 		request.setAttribute(WEB_APPLICATION_CONTEXT_ATTRIBUTE, getWebApplicationContext());
 		request.setAttribute(LOCALE_RESOLVER_ATTRIBUTE, this.localeResolver);
 
+		// 4. 初始化 FlashMap 管理器 (用于重定向传参)
+		// FlashMap 用于在 Post/Redirect/Get 模式下传递临时属性。
 		if (this.flashMapManager != null) {
+			// 尝试从 Session 中检索上一个请求传递过来的 InputFlashMap（例如重定向后的“操作成功”消息）
 			FlashMap inputFlashMap = this.flashMapManager.retrieveAndUpdate(request, response);
 			if (inputFlashMap != null) {
+				// 将检索到的 InputFlashMap 绑定到 Request，供 Controller 使用（只读）
 				request.setAttribute(INPUT_FLASH_MAP_ATTRIBUTE, Collections.unmodifiableMap(inputFlashMap));
 			}
+			// 初始化一个新的 OutputFlashMap，用于本次请求可能发生的重定向传参
 			request.setAttribute(OUTPUT_FLASH_MAP_ATTRIBUTE, new FlashMap());
 			request.setAttribute(FLASH_MAP_MANAGER_ATTRIBUTE, this.flashMapManager);
 		}
 
+		// 5. 解析并缓存请求路径 (RequestPath)
+		// Spring 5.3+ 引入的优化。保存先前的路径信息（支持嵌套请求），并解析当前请求的 RequestPath。
+		// 这用于后续 PathPatternParser 进行更高效的路由匹配。
 		RequestPath previousRequestPath = null;
 		if (this.parseRequestPath) {
 			previousRequestPath = (RequestPath) request.getAttribute(ServletRequestPathUtils.PATH_ATTRIBUTE);
@@ -863,15 +890,25 @@ public class DispatcherServlet extends FrameworkServlet {
 		}
 
 		try {
+			// 6. 执行核心分发流程
+			// 调用 doDispatch 方法，进行 Handler 查找、适配器执行、逻辑处理及视图渲染。
 			doDispatch(request, response);
 		}
 		finally {
+			// 7. 请求结束后的状态恢复与清理
+
+			// 检查是否启动了异步处理 (Async Processing)。
+			// 如果异步处理已启动，说明请求并未真正结束（只是 Servlet 线程释放），因此暂不恢复属性。
 			if (!WebAsyncUtils.getAsyncManager(request).isConcurrentHandlingStarted()) {
 				// Restore the original attribute snapshot, in case of an include.
+				// 如果这是一个 include 请求，并且之前保存了快照，
+				// 则将 Request 属性恢复到执行前的状态，确保对外部请求无副作用。
 				if (attributesSnapshot != null) {
 					restoreAttributesAfterInclude(request, attributesSnapshot);
 				}
 			}
+
+			// 恢复之前的请求路径信息
 			if (this.parseRequestPath) {
 				ServletRequestPathUtils.setParsedRequestPath(previousRequestPath, request);
 			}
@@ -937,6 +974,7 @@ public class DispatcherServlet extends FrameworkServlet {
 		HandlerExecutionChain mappedHandler = null;
 		boolean multipartRequestParsed = false;
 
+		// 获取异步请求管理器，用于处理 Servlet 3.0+ 的异步场景 (Callable/DeferredResult)
 		WebAsyncManager asyncManager = WebAsyncUtils.getAsyncManager(request);
 
 		try {
@@ -944,42 +982,73 @@ public class DispatcherServlet extends FrameworkServlet {
 			Exception dispatchException = null;
 
 			try {
+				// 1. 检查并处理 Multipart 请求 (文件上传)
+				// 如果是 multipart/form-data 类型，将 request 包装为 MultipartHttpServletRequest
 				processedRequest = checkMultipart(request);
 				multipartRequestParsed = (processedRequest != request);
 
 				// Determine handler for the current request.
+				// 2.【核心步骤】确定当前请求的处理器 (Handler)
+				// 遍历 HandlerMapping 集合，找到对应的 HandlerExecutionChain (包含 Handler 对象和拦截器链)
 				mappedHandler = getHandler(processedRequest);
 				if (mappedHandler == null) {
+					// 如果找不到对应的 Handler，处理 404 情况 (抛出 NoHandlerFoundException 或设置 404 状态码)
 					noHandlerFound(processedRequest, response);
 					return;
 				}
 
+				// 3. 执行拦截器的 preHandle 方法
+				// 正向遍历拦截器链。如果任一拦截器返回 false，则流程中断，直接返回。
 				if (!mappedHandler.applyPreHandle(processedRequest, response)) {
 					return;
 				}
 
 				// Determine handler adapter and invoke the handler.
+				// 4.【核心步骤】确定 HandlerAdapter
+				// 根据 Handler 的类型，找到支持它的适配器 (如 RequestMappingHandlerAdapter)
 				HandlerAdapter ha = getHandlerAdapter(mappedHandler.getHandler());
+
+				// 5.【核心步骤】调用处理器 (Invoke Handler)
+				// 适配器执行 Handler (即 Controller 方法)，处理参数绑定、反射调用、返回值处理。
+				// 返回一个 ModelAndView 对象 (如果是 @ResponseBody 或异步请求，mv 可能为 null)
+				// 注意：如果是 GET 请求，HandlerAdapter 内部可能会处理 Last-Modified 缓存逻辑。
 				mv = ha.handle(processedRequest, response, mappedHandler.getHandler());
 
+				// 6. 检查异步处理状态
+				// 如果 Controller 开启了异步处理 (返回 Callable 等)，DispatcherServlet 必须停止当前的同步处理流程。
+				// 此时不进行视图渲染，直接退出，等待异步结果产生后的再次分发 (Resume)。
 				if (asyncManager.isConcurrentHandlingStarted()) {
 					return;
 				}
 
+				// 7. 应用默认视图名 (如果 Controller 返回的 mv 非空但没有视图名)
 				applyDefaultViewName(processedRequest, mv);
+
+				// 8. 执行拦截器的 postHandle 方法
+				// 逆向遍历拦截器链。此时 Controller 已执行完毕，但视图尚未渲染。
+				// 拦截器可以在这里修改 ModelAndView。
 				mappedHandler.applyPostHandle(processedRequest, response, mv);
 			}
 			catch (Exception ex) {
+				// 捕获 Handler 执行期间抛出的异常，暂存以便后续 processDispatchResult 处理
 				dispatchException = ex;
 			}
 			catch (Throwable err) {
 				// As of 4.3, we're processing Errors thrown from handler methods as well,
 				// making them available for @ExceptionHandler methods and other scenarios.
+				// 捕获 Error 级别的错误，包装为 ServletException
 				dispatchException = new ServletException("Handler dispatch failed: " + err, err);
 			}
+
+			// 9.【核心步骤】处理分发结果
+			// 负责：
+			// a. 处理异常 (如果有 dispatchException)，调用 HandlerExceptionResolver。
+			// b. 渲染视图 (如果 mv 不为 null)，调用 ViewResolver。
+			// c. 触发拦截器的 afterCompletion 方法 (无论成功或失败)。
 			processDispatchResult(processedRequest, response, mappedHandler, mv, dispatchException);
 		}
 		catch (Exception ex) {
+			// 如果在视图渲染或结果处理阶段发生异常，直接触发 afterCompletion
 			triggerAfterCompletion(processedRequest, response, mappedHandler, ex);
 		}
 		catch (Throwable err) {
@@ -987,15 +1056,21 @@ public class DispatcherServlet extends FrameworkServlet {
 					new ServletException("Handler processing failed: " + err, err));
 		}
 		finally {
+			// 10. 最终清理工作
+
 			if (asyncManager.isConcurrentHandlingStarted()) {
 				// Instead of postHandle and afterCompletion
+				// 如果是异步请求启动阶段
 				if (mappedHandler != null) {
+					// 调用拦截器的 afterConcurrentHandlingStarted 方法 (替代 postHandle/afterCompletion)
 					mappedHandler.applyAfterConcurrentHandlingStarted(processedRequest, response);
 				}
 				asyncManager.setMultipartRequestParsed(multipartRequestParsed);
 			}
 			else {
 				// Clean up any resources used by a multipart request.
+				// 如果是同步请求结束，或异步请求结束
+				// 清理 Multipart 请求产生的资源 (如删除临时上传文件)
 				if (multipartRequestParsed || asyncManager.isMultipartRequestParsed()) {
 					cleanupMultipart(processedRequest);
 				}
@@ -1025,21 +1100,37 @@ public class DispatcherServlet extends FrameworkServlet {
 
 		boolean errorView = false;
 
+		// 1. 异常处理 (Exception Handling)
 		if (exception != null) {
+			// 情况 A: 这是一个 ModelAndViewDefiningException
+			// (这是一种特殊的异常，它自己内部就携带了 ModelAndView，通常不常用)
 			if (exception instanceof ModelAndViewDefiningException mavDefiningException) {
 				logger.debug("ModelAndViewDefiningException encountered", exception);
 				mv = mavDefiningException.getModelAndView();
 			}
+			// 情况 B: 普通异常 (最常见的情况)
 			else {
 				Object handler = (mappedHandler != null ? mappedHandler.getHandler() : null);
+
+				// 【核心】调用 HandlerExceptionResolver 链尝试解析异常
+				// 这里是 @ExceptionHandler, @ControllerAdvice 发挥作用的地方
+				// 如果解析成功，会返回一个指向错误页面的 ModelAndView
 				mv = processHandlerException(request, response, handler, exception);
+
+				// 标记这是一个错误视图，以便后续清理错误属性
 				errorView = (mv != null);
 			}
 		}
 
 		// Did the handler return a view to render?
+		// 2. 视图渲染 (View Rendering)
+		// 如果 Handler 返回了 ModelAndView (且没有被清理)
+		// 注意：如果是 @ResponseBody，这里的 mv 通常为 null，会跳过此步骤
 		if (mv != null && !mv.wasCleared()) {
+			// 【核心】调用 ViewResolver 将逻辑视图名解析为物理视图，并进行渲染
 			render(mv, request, response);
+
+			// 如果刚才渲染的是异常处理产生的错误页，清理 Request 中的错误属性
 			if (errorView) {
 				WebUtils.clearErrorRequestAttributes(request);
 			}
@@ -1050,13 +1141,24 @@ public class DispatcherServlet extends FrameworkServlet {
 			}
 		}
 
+		// 3. 异步处理检查
+		// 如果在处理异常或渲染的过程中开启了异步处理 (Concurrent Handling)
 		if (WebAsyncUtils.getAsyncManager(request).isConcurrentHandlingStarted()) {
 			// Concurrent handling started during a forward
+			// 直接返回，不要触发 afterCompletion
+			// 因为对于异步请求，afterCompletion 应该在异步线程结束时触发，而不是现在
 			return;
 		}
 
+		// ---------------------------------------------------------
+		// 4. 触发拦截器收尾 (Interceptor Cleanup)
+		// ---------------------------------------------------------
 		if (mappedHandler != null) {
 			// Exception (if any) is already handled..
+			// 无论请求成功还是失败
+			// 都要触发拦截器的 afterCompletion 方法 (相当于 finally 块)
+			// 这里的第三个参数 exception 传 null，是因为异常在上面已经被 processHandlerException 处理过了
+			// 或者如果异常没被处理，它会继续向上抛出，不会走到这里 (看 doDispatch 的 catch 块逻辑)
 			mappedHandler.triggerAfterCompletion(request, response, null);
 		}
 	}
@@ -1153,7 +1255,9 @@ public class DispatcherServlet extends FrameworkServlet {
 	 */
 	protected @Nullable HandlerExecutionChain getHandler(HttpServletRequest request) throws Exception {
 		if (this.handlerMappings != null) {
+			// 遍历所有初始化的 HandlerMapping
 			for (HandlerMapping mapping : this.handlerMappings) {
+				// 判断是否能处理该请求
 				HandlerExecutionChain handler = mapping.getHandler(request);
 				if (handler != null) {
 					return handler;

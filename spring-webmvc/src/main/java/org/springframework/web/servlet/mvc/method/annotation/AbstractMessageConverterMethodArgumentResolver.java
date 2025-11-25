@@ -147,42 +147,66 @@ public abstract class AbstractMessageConverterMethodArgumentResolver implements 
 	protected <T> @Nullable Object readWithMessageConverters(HttpInputMessage inputMessage, MethodParameter parameter,
 			Type targetType) throws IOException, HttpMediaTypeNotSupportedException, HttpMessageNotReadableException {
 
+		// 1. 获取上下文和目标类型信息
+		// 比如 Controller 的类信息
 		Class<?> contextClass = parameter.getContainingClass();
+		// 目标参数的 Class 类型 (例如 User.class)
 		Class<T> targetClass = (targetType instanceof Class clazz ? clazz : null);
+		// Spring 封装的高级类型工具，用于处理泛型 (例如 List<User>)
 		ResolvableType resolvableType = ResolvableType.forMethodParameter(parameter);
 		if (targetClass == null) {
+			// 如果 targetType 不是 Class (比如是 ParameterizedType)，尝试解析出原始 Class
 			targetClass = (Class<T>) resolvableType.resolve();
 		}
 
+		// 2. 获取请求的 Content-Type (媒体类型)
+		// 客户端告诉服务器：我发给你的是什么格式的数据？(例如 application/json;charset=UTF-8)
 		MediaType contentType;
 		boolean noContentType = false;
 		try {
 			contentType = inputMessage.getHeaders().getContentType();
 		}
 		catch (InvalidMediaTypeException ex) {
+			// 如果 Content-Type 格式非法，抛出 415 异常
 			throw new HttpMediaTypeNotSupportedException(
 					ex.getMessage(), getSupportedMediaTypes(targetClass != null ? targetClass : Object.class));
 		}
 		if (contentType == null) {
+			// 如果没传 Content-Type，默认为二进制流 (application/octet-stream)
 			noContentType = true;
 			contentType = MediaType.APPLICATION_OCTET_STREAM;
 		}
 
+		// 获取 HTTP 方法 (GET, POST...)
 		HttpMethod httpMethod = (inputMessage instanceof HttpRequest httpRequest ? httpRequest.getMethod() : null);
+		// 设置 body 初始值为“无值”标记
 		Object body = NO_VALUE;
 
+		// 3. 准备读取 Body
+		// 使用 PushbackInputStream 包装流，以便在不消耗流的情况下检查 body 是否为空
 		EmptyBodyCheckingHttpInputMessage message = null;
 		try {
 			ResolvableType targetResolvableType = null;
 			message = new EmptyBodyCheckingHttpInputMessage(inputMessage);
+
+			// 4. 【核心循环】遍历所有的 HttpMessageConverter
+			// Spring 启动时配置了一堆转换器 (ByteArray, String, Jackson 等)
 			for (HttpMessageConverter<?> converter : this.messageConverters) {
 				Class<? extends HttpMessageConverter<?>> converterClass = (Class<? extends HttpMessageConverter<?>>) converter.getClass();
 				ConverterType converterTypeToUse = null;
+
+				// -----------------------------------------------------------
+				// 4.1 询问转换器：你能读取这种类型的数据吗？(canRead)
+				// -----------------------------------------------------------
+
+				// 情况 A: 这是一个泛型转换器 (如 AbstractJackson2HttpMessageConverter)
+				// 它能处理带泛型的复杂类型
 				if (converter instanceof GenericHttpMessageConverter<?> genericConverter) {
 					if (genericConverter.canRead(targetType, contextClass, contentType)) {
 						converterTypeToUse = ConverterType.GENERIC;
 					}
 				}
+				// 情况 B: 这是一个智能转换器 (SmartHttpMessageConverter)
 				else if (converter instanceof SmartHttpMessageConverter<?> smartConverter) {
 					if (targetResolvableType == null) {
 						targetResolvableType = getNestedTypeIfNeeded(resolvableType);
@@ -191,28 +215,46 @@ public abstract class AbstractMessageConverterMethodArgumentResolver implements 
 						converterTypeToUse = ConverterType.SMART;
 					}
 				}
+				// 情况 C: 普通转换器
+				// 只能根据 Class 类型和 MediaType 判断
 				else if (targetClass != null && converter.canRead(targetClass, contentType)) {
 					converterTypeToUse = ConverterType.BASE;
 				}
+
+				// -----------------------------------------------------------
+				// 4.2 如果找到了合适的转换器，开始读取 (Read)
+				// -----------------------------------------------------------
 				if (converterTypeToUse != null) {
 					if (message.hasBody()) {
+						// AOP 扩展点：触发 RequestBodyAdvice 的 beforeBodyRead 方法
+						// 允许你在读取前对 InputMessage 进行修改（例如解密）
 						HttpInputMessage msgToUse = this.advice.beforeBodyRead(message, parameter, targetType, converterClass);
+
+						// 【真正干活】调用 converter.read() 进行反序列化
+						// 这里 Jackson 会接管，把 JSON 流转成 Java 对象
 						body = switch (converterTypeToUse) {
 							case BASE -> ((HttpMessageConverter<T>) converter).read(targetClass, msgToUse);
 							case GENERIC -> ((GenericHttpMessageConverter<?>) converter).read(targetType, contextClass, msgToUse);
 							case SMART -> ((SmartHttpMessageConverter<?>) converter).read(targetResolvableType, msgToUse,
 									this.advice.determineReadHints(parameter, targetType, (Class<SmartHttpMessageConverter<?>>) converterClass));
 						};
+
+						// AOP 扩展点：触发 RequestBodyAdvice 的 afterBodyRead 方法
+						// 允许你在对象转换完成后进行修改
 						body = this.advice.afterBodyRead(body, msgToUse, parameter, targetType, converterClass);
 					}
 					else {
+						// 如果 Body 是空的，触发 handleEmptyBody
 						body = this.advice.handleEmptyBody(null, message, parameter, targetType, converterClass);
 					}
+					// 找到了转换器并处理完毕，跳出循环
 					break;
 				}
 
 			}
 
+			// 5. 特殊情况处理
+			// 如果遍历完了都没读到东西，且没有 Content-Type 且 Body 为空
 			if (body == NO_VALUE && noContentType && !message.hasBody()) {
 				body = this.advice.handleEmptyBody(
 						null, message, parameter, targetType, NoContentTypeHttpMessageConverter.class);
@@ -222,19 +264,26 @@ public abstract class AbstractMessageConverterMethodArgumentResolver implements 
 			throw new HttpMessageNotReadableException("I/O error while reading input message", ex, inputMessage);
 		}
 		finally {
+			// 确保流被关闭（如果需要）
 			if (message != null && message.hasBody()) {
 				closeStreamIfNecessary(message.getBody());
 			}
 		}
 
+		// 6. 最终结果校验
+		// 如果 body 依然是 NO_VALUE，说明没有找到任何能处理的 Converter
 		if (body == NO_VALUE) {
+			// 如果是 GET 等不需要 Body 的方法，或者 Body 确实为空，则返回 null
 			if (httpMethod == null || !SUPPORTED_METHODS.contains(httpMethod) || (noContentType && !message.hasBody())) {
 				return null;
 			}
+			// 否则，抛出 415 Unsupported Media Type 异常
+			// 告诉客户端：你发的 Content-Type 我这里没法处理
 			throw new HttpMediaTypeNotSupportedException(contentType,
 					getSupportedMediaTypes(targetClass != null ? targetClass : Object.class), httpMethod);
 		}
 
+		// 7. 打印日志并返回
 		MediaType selectedContentType = contentType;
 		Object theBody = body;
 		LogFormatUtils.traceDebug(logger, traceOn -> {

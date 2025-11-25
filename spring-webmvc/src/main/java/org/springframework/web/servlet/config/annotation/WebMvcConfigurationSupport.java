@@ -507,6 +507,10 @@ public class WebMvcConfigurationSupport implements ApplicationContextAware, Serv
 		}
 		// else: AbstractHandlerMapping defaults to PathPatternParser
 
+		// 【关键】注入拦截器
+		// getInterceptors() 方法会调用 addInterceptors(registry)，
+		// 而 addInterceptors 在子类 DelegatingWebMvcConfiguration 中被重写了，
+		// 从而调用了你写的 WebMvcConfigurer.addInterceptors()。
 		mapping.setInterceptors(getInterceptors(conversionService, resourceUrlProvider));
 		mapping.setCorsConfigurations(getCorsConfigurations());
 	}
@@ -648,7 +652,9 @@ public class WebMvcConfigurationSupport implements ApplicationContextAware, Serv
 			@Qualifier("mvcConversionService") FormattingConversionService conversionService,
 			@Qualifier("mvcValidator") Validator validator) {
 
+		// 1. 创建实例
 		RequestMappingHandlerAdapter adapter = createRequestMappingHandlerAdapter();
+		// 2. 配置基础属性
 		adapter.setContentNegotiationManager(contentNegotiationManager);
 		adapter.setMessageConverters(getMessageConverters());
 		adapter.setWebBindingInitializer(getConfigurableWebBindingInitializer(conversionService, validator));
@@ -671,6 +677,7 @@ public class WebMvcConfigurationSupport implements ApplicationContextAware, Serv
 			adapter.setResponseBodyAdvice(responseBodyAdvices);
 		}
 
+		// 3. 处理 Async
 		AsyncSupportConfigurer configurer = getAsyncSupportConfigurer();
 		if (configurer.getTaskExecutor() != null) {
 			adapter.setTaskExecutor(configurer.getTaskExecutor());

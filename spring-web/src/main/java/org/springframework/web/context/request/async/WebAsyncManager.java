@@ -316,6 +316,9 @@ public final class WebAsyncManager {
 			this.asyncWebRequest.setTimeout(timeout);
 		}
 
+		// 1. 获取线程池 (TaskExecutor)
+		// Spring 默认会用 SimpleAsyncTaskExecutor (每次 new 线程)，
+		// 生产环境通常配置一个 ThreadPoolTaskExecutor (线程池)。
 		AsyncTaskExecutor executor = webAsyncTask.getExecutor();
 		if (executor != null) {
 			this.taskExecutor = executor;
@@ -358,10 +361,14 @@ public final class WebAsyncManager {
 		interceptorChain.applyBeforeConcurrentHandling(this.asyncWebRequest, callable);
 		startAsyncProcessing(processingContext);
 		try {
+			// 2. 提交任务
+			// 这一步之后，Callable 就离开了当前线程的控制
 			Future<?> future = this.taskExecutor.submit(() -> {
+				// ... 这里面的代码将在【副线程】里运行 ...
 				Object result = null;
 				try {
 					interceptorChain.applyPreProcess(this.asyncWebRequest, callable);
+					// A. 执行你的逻辑
 					result = callable.call();
 				}
 				catch (Throwable ex) {
@@ -370,6 +377,7 @@ public final class WebAsyncManager {
 				finally {
 					result = interceptorChain.applyPostProcess(this.asyncWebRequest, callable, result);
 				}
+				// B. 拿到结果后，通知 Spring 进行 dispatch (Resume)
 				setConcurrentResultAndDispatch(result);
 			});
 			interceptorChain.setTaskFuture(future);

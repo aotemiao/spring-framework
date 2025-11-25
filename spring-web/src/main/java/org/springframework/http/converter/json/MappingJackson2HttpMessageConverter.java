@@ -62,6 +62,8 @@ public class MappingJackson2HttpMessageConverter extends AbstractJackson2HttpMes
 	 * provided by {@link Jackson2ObjectMapperBuilder}.
 	 */
 	public MappingJackson2HttpMessageConverter() {
+		// 【关键】默认创建一个 Jackson 的 ObjectMapper
+		// 这就是为什么你什么都不配，Spring Boot 也能转 JSON 的原因
 		this(Jackson2ObjectMapperBuilder.json().build());
 	}
 

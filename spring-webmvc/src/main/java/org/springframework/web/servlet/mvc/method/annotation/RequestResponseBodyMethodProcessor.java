@@ -127,11 +127,14 @@ public class RequestResponseBodyMethodProcessor extends AbstractMessageConverter
 
 	@Override
 	public boolean supportsParameter(MethodParameter parameter) {
+		// 解析加了 @RequestBody 注解的参数
 		return parameter.hasParameterAnnotation(RequestBody.class);
 	}
 
 	@Override
 	public boolean supportsReturnType(MethodParameter returnType) {
+		// 1. 检查方法上有没有 @ResponseBody
+		// 2. 或者类上有没有 @ResponseBody (比如 @RestController = @Controller + @ResponseBody)
 		return (AnnotatedElementUtils.hasAnnotation(returnType.getContainingClass(), ResponseBody.class) ||
 				returnType.hasMethodAnnotation(ResponseBody.class));
 	}
@@ -146,24 +149,57 @@ public class RequestResponseBodyMethodProcessor extends AbstractMessageConverter
 	public @Nullable Object resolveArgument(MethodParameter parameter, @Nullable ModelAndViewContainer mavContainer,
 			NativeWebRequest webRequest, @Nullable WebDataBinderFactory binderFactory) throws Exception {
 
+		// 1. 处理 Optional 包装
+		// 如果 Controller 的参数类型是 Optional<User>，这里会将其解包，
+		// 让 parameter 指向内部的泛型类型 (User)。
+		// 目的是为了让后续的 MessageConverter 能够识别真正的目标类型进行反序列化。
 		parameter = parameter.nestedIfOptional();
+
+		// 2. 【核心】读取 HTTP Body 并反序列化
+		// 调用父类方法，根据 Content-Type (如 application/json) 选择合适的 HttpMessageConverter (如 Jackson)，
+		// 读取请求流并将数据转换成 Java 对象 (arg)。
 		Object arg = readWithMessageConverters(webRequest, parameter, parameter.getNestedGenericParameterType());
 
+		// 3. 数据绑定与校验流程
 		if (binderFactory != null) {
+
+			// 获取参数名称 (例如 "user")，用于生成 BindingResult 的 Key
 			String name = Conventions.getVariableNameForParameter(parameter);
 			ResolvableType type = ResolvableType.forMethodParameter(parameter);
+
+			// 创建 WebDataBinder (数据绑定器)
+			// Binder 就像一个档案袋，它持有目标对象 (arg)、对象类型信息以及校验结果 (BindingResult)
 			WebDataBinder binder = binderFactory.createBinder(webRequest, arg, name, type);
+
 			if (arg != null) {
+				// 4. 执行校验逻辑
+				// 检查参数上是否有 @Valid 或 @Validated 注解。
+				// 如果有，则触发 Validator (通常是 Hibernate Validator) 对 arg 进行校验。
 				validateIfApplicable(binder, parameter);
+
+				// 5. 决定是否抛出异常
+				// binder.getBindingResult().hasErrors(): 检查是否有校验错误。
+				// isBindExceptionRequired: 检查 Controller 方法参数列表中是否紧跟了一个 BindingResult 参数。
+				// -> 如果没写 BindingResult (返回 true)，说明开发者不打算自己处理错误，Spring 就会抛出异常中断流程。
+				// -> 如果写了 BindingResult (返回 false)，Spring 就不抛异常，而是把错误交给开发者处理。
 				if (binder.getBindingResult().hasErrors() && isBindExceptionRequired(binder, parameter)) {
+					// 抛出参数校验异常 (默认会被映射为 HTTP 400 Bad Request)
 					throw new MethodArgumentNotValidException(parameter, binder.getBindingResult());
 				}
 			}
+
+			// 6. 保存校验结果
+			// 将 BindingResult 放入 Model 容器中。
+			// 这样后续的拦截器或视图层可以通过 Key 获取校验详情。
 			if (mavContainer != null) {
 				mavContainer.addAttribute(BindingResult.MODEL_KEY_PREFIX + name, binder.getBindingResult());
 			}
 		}
 
+		// 7. 适配返回值
+		// 对应第 1 步的解包操作。
+		// 如果原始参数是 Optional<User>，这里会将 arg 重新包装为 Optional 对象返回。
+		// 如果原始参数是 User，则直接返回 arg。
 		return adaptArgumentIfNecessary(arg, parameter);
 	}
 
@@ -190,20 +226,42 @@ public class RequestResponseBodyMethodProcessor extends AbstractMessageConverter
 			ModelAndViewContainer mavContainer, NativeWebRequest webRequest)
 			throws IOException, HttpMediaTypeNotAcceptableException, HttpMessageNotWritableException {
 
+		// 1. 【关键】标记请求已处理 (Flag as Handled)
+		// 这行代码至关重要！它告诉 ModelAndViewContainer：
+		// “我已经处理完响应了（或者马上就要写完了），请不要再去找 ViewResolver 渲染视图了。”
+		// 这就是为什么加了 @ResponseBody 就不会跳转 JSP/HTML 的根本原因。
 		mavContainer.setRequestHandled(true);
+
+		// 2. 包装 Request 和 Response
+		// 将原生的 HttpServletRequest/Response 包装成 Spring 的 HttpInputMessage/HttpOutputMessage
+		// 以便后续 MessageConverter 使用。
 		ServletServerHttpRequest inputMessage = createInputMessage(webRequest);
 		ServletServerHttpResponse outputMessage = createOutputMessage(webRequest);
 
+		// 3. 【Spring 6 新特性】处理 ProblemDetail (RFC 7807 错误详情)
+		// 如果 Controller 返回的是一个标准错误对象 ProblemDetail
 		if (returnValue instanceof ProblemDetail detail) {
+			// 3.1 同步状态码：把对象里的 status (如 404) 设置到 HTTP 响应头中
 			outputMessage.setStatusCode(HttpStatusCode.valueOf(detail.getStatus()));
+
+			// 3.2 自动填充 Instance URI
+			// 如果开发者没填 instance 字段，默认将其设为当前请求的 URI
 			if (detail.getInstance() == null) {
 				URI path = URI.create(inputMessage.getServletRequest().getRequestURI());
 				detail.setInstance(path);
 			}
+
+			// 3.3 触发错误拦截器 (ErrorResponseInterceptor)
+			// 允许开发者对 ProblemDetail 进行全局的统一修改
 			invokeErrorResponseInterceptors(detail, null);
 		}
 
 		// Try even with null return value. ResponseBodyAdvice could get involved.
+		// 4. 【核心】调用消息转换器进行写入
+		// 这里调用的是父类 AbstractMessageConverterMethodProcessor 的方法。
+		// 注意：即使 returnValue 是 null，也要进来！
+		// 原因：可能存在 ResponseBodyAdvice (切面)，它可能会拦截 null 并修改为非 null 的值，
+		// 或者即使 Body 为空，也需要处理 Response Header。
 		writeWithMessageConverters(returnValue, returnType, inputMessage, outputMessage);
 	}
 
