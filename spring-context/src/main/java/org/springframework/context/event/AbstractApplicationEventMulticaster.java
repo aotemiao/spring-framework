@@ -75,7 +75,6 @@ public abstract class AbstractApplicationEventMulticaster
 
 	private @Nullable ConfigurableBeanFactory beanFactory;
 
-
 	@Override
 	public void setBeanClassLoader(ClassLoader classLoader) {
 		this.beanClassLoader = classLoader;
@@ -99,7 +98,6 @@ public abstract class AbstractApplicationEventMulticaster
 		}
 		return this.beanFactory;
 	}
-
 
 	@Override
 	public void addApplicationListener(ApplicationListener<?> listener) {
@@ -190,15 +188,19 @@ public abstract class AbstractApplicationEventMulticaster
 
 		Object source = event.getSource();
 		Class<?> sourceType = (source != null ? source.getClass() : null);
+		// 1. 生成缓存 Key
+		// Key 由 "事件类型 (EventType)" + "事件源类型 (SourceType)" 共同决定
 		ListenerCacheKey cacheKey = new ListenerCacheKey(eventType, sourceType);
 
 		// Potential new retriever to populate
 		CachedListenerRetriever newRetriever = null;
 
 		// Quick check for existing entry on ConcurrentHashMap
+		// 2. 尝试从缓存中获取 CachedListenerRetriever
 		CachedListenerRetriever existingRetriever = this.retrieverCache.get(cacheKey);
 		if (existingRetriever == null) {
 			// Caching a new ListenerRetriever if possible
+			// 3. 如果缓存中没有，且类加载器安全，则创建一个新的 CachedListenerRetriever 并放入缓存
 			if (this.beanClassLoader == null ||
 					(ClassUtils.isCacheSafe(event.getClass(), this.beanClassLoader) &&
 							(sourceType == null || ClassUtils.isCacheSafe(sourceType, this.beanClassLoader)))) {
@@ -211,14 +213,17 @@ public abstract class AbstractApplicationEventMulticaster
 		}
 
 		if (existingRetriever != null) {
+			// 4. 如果获取到了 CachedListenerRetriever，尝试从中获取监听器集合
 			Collection<ApplicationListener<?>> result = existingRetriever.getApplicationListeners();
 			if (result != null) {
 				return result;
 			}
 			// If result is null, the existing retriever is not fully populated yet by another thread.
 			// Proceed like caching wasn't possible for this current local attempt.
+			// 如果 result 为 null，说明其他线程正在填充该 retriever，当前线程不等待，直接执行查找逻辑
 		}
 
+		// 5. 实际查找监听器，如果 newRetriever 不为 null，则会填充到 newRetriever 中
 		return retrieveApplicationListeners(eventType, sourceType, newRetriever);
 	}
 
@@ -233,10 +238,19 @@ public abstract class AbstractApplicationEventMulticaster
 	private Collection<ApplicationListener<?>> retrieveApplicationListeners(
 			ResolvableType eventType, @Nullable Class<?> sourceType, @Nullable CachedListenerRetriever retriever) {
 
+		// 1. 初始化结果集合
+		// allListeners: 用于存储本次查找的最终结果(有序)
 		List<ApplicationListener<?>> allListeners = new ArrayList<>();
+
+		// 下面两个集合用于构建缓存(如果 retriever 不为空)。
+		// filteredListeners: 存储匹配的单例(Singleton)监听器实例
+		// filteredListenerBeans: 存储匹配的非单例(Prototype)监听器 Bean 名称
 		Set<ApplicationListener<?>> filteredListeners = (retriever != null ? new LinkedHashSet<>() : null);
 		Set<String> filteredListenerBeans = (retriever != null ? new LinkedHashSet<>() : null);
 
+		// 2. 获取快照 (Snapshot)
+		// 从 defaultRetriever 中获取所有已注册的监听器(实例)和监听器 Bean 名称。
+		// 使用 synchronized 保证线程安全，并创建副本以避免遍历时发生 ConcurrentModificationException。
 		Set<ApplicationListener<?>> listeners;
 		Set<String> listenerBeans;
 		synchronized (this.defaultRetriever) {
@@ -246,7 +260,10 @@ public abstract class AbstractApplicationEventMulticaster
 
 		// Add programmatically registered listeners, including ones coming
 		// from ApplicationListenerDetector (singleton beans and inner beans).
+		// 3. 遍历编程式注册的监听器 (Programmatically registered listeners)
+		// 包括通过 ctx.addApplicationListener() 添加的，以及 ApplicationListenerDetector 自动检测到的单例 Bean。
 		for (ApplicationListener<?> listener : listeners) {
+			// 【核心匹配】检查监听器是否支持当前事件类型和源类型
 			if (supportsEvent(listener, eventType, sourceType)) {
 				if (retriever != null) {
 					filteredListeners.add(listener);
@@ -257,11 +274,19 @@ public abstract class AbstractApplicationEventMulticaster
 
 		// Add listeners by bean name, potentially overlapping with programmatically
 		// registered listeners above - but here potentially with additional metadata.
+		// 4. 遍历通过 Bean 名称注册的监听器
+		// 这些通常是 XML 或 @Component 定义的 Bean，可能还没实例化。
 		if (!listenerBeans.isEmpty()) {
 			ConfigurableBeanFactory beanFactory = getBeanFactory();
 			for (String listenerBeanName : listenerBeans) {
 				try {
+					// 4.1 预检查 (Pre-check)
+					// 在实例化 Bean 之前，先检查 BeanDefinition(元数据)是否匹配事件类型。
+					// 这是一个性能优化，避免为了检查是否匹配而创建不必要的 Bean 实例。
 					if (supportsEvent(beanFactory, listenerBeanName, eventType)) {
+
+						// 4.2 实例化 Bean
+						// 元数据匹配通过，必须创建 Bean 实例来进行最终的运行时检查。
 						ApplicationListener<?> listener =
 								beanFactory.getBean(listenerBeanName, ApplicationListener.class);
 
@@ -269,9 +294,21 @@ public abstract class AbstractApplicationEventMulticaster
 						// list of programmatically registered listeners. In order to avoid duplicates, we need to find
 						// and replace them by their proxy counterparts, because if both a proxy and its target end up
 						// in 'allListeners', listeners will fire twice.
+
+						// 4.3 【关键逻辑】处理 AOP 代理去重
+						// 背景：某些单例 Bean 可能既存在于上面的 'listeners' 集合中(因为是单例，被 Detector 捕捉了)，
+						// 又存在于这里的 'listenerBeans' 集合中。
+						// 如果这个 Bean 被 AOP 代理了(比如加了 @Async 或 @Transactional)，
+						// 'listeners' 里存的可能是原始目标对象 (Target)，而这里 getBean 拿到的是代理对象 (Proxy)。
+						// 必须把原始对象替换为代理对象，否则同一个监听器会被执行两次(一次原始，一次代理)。
+
+						// 获取 Bean 的原始目标对象(如果它是一个 AOP 代理)
 						ApplicationListener<?> unwrappedListener =
 								(ApplicationListener<?>) AopProxyUtils.getSingletonTarget(listener);
 						if (listener != unwrappedListener) {
+							// 如果当前 listener 是代理对象，且 unwrappedListener (目标对象) 已经在列表里了
+							// 说明之前可能通过 ApplicationListenerDetector 注册了原始对象。
+							// 此时需要移除原始对象，用代理对象替换它，以确保 AOP 增强生效(如 @Async, @Transaction)
 							if (filteredListeners != null && filteredListeners.contains(unwrappedListener)) {
 								filteredListeners.remove(unwrappedListener);
 								filteredListeners.add(listener);
@@ -282,12 +319,17 @@ public abstract class AbstractApplicationEventMulticaster
 							}
 						}
 
+						// 4.4 再次检查并添加到结果集
+						// 确保没有重复添加，且实例检查也通过。
 						if (!allListeners.contains(listener) && supportsEvent(listener, eventType, sourceType)) {
 							if (retriever != null) {
+								// 如果是单例，缓存实例对象
 								if (beanFactory.isSingleton(listenerBeanName)) {
 									filteredListeners.add(listener);
 								}
 								else {
+									// 如果是 Prototype 或其他 Scope，不能缓存实例，只能缓存 BeanName
+									// 每次发布事件时都需要重新 getBean
 									filteredListenerBeans.add(listenerBeanName);
 								}
 							}
@@ -298,6 +340,9 @@ public abstract class AbstractApplicationEventMulticaster
 						// Remove non-matching listeners that originally came from
 						// ApplicationListenerDetector, possibly ruled out by additional
 						// BeanDefinition metadata (for example, factory method generics) above.
+						// 4.5 移除不匹配的监听器
+						// 如果 BeanDefinition 元数据就不匹配，但该 Bean 之前可能因为某些原因(如 Detector)
+						// 被加入到了 allListeners 中，这里进行防御性移除。
 						Object listener = beanFactory.getSingleton(listenerBeanName);
 						if (retriever != null) {
 							filteredListeners.remove(listener);
@@ -308,21 +353,30 @@ public abstract class AbstractApplicationEventMulticaster
 				catch (NoSuchBeanDefinitionException ex) {
 					// Singleton listener instance (without backing bean definition) disappeared -
 					// probably in the middle of the destruction phase
+					// 容错处理：Bean 定义可能在迭代过程中消失了(例如容器正在关闭中)
 				}
 			}
 		}
 
+		// 5. 排序
+		// 根据 @Order 注解或 Ordered 接口进行排序
 		AnnotationAwareOrderComparator.sort(allListeners);
+
+		// 6. 回填缓存 (Populate Cache)
+		// 如果提供了 retriever，将本次计算出的结果写入缓存，下次同样的事件类型直接 O(1) 返回。
 		if (retriever != null) {
 			if (CollectionUtils.isEmpty(filteredListenerBeans)) {
+				// 如果没有 Prototype Bean，直接缓存所有实例列表，这是最高效的路径
 				retriever.applicationListeners = new LinkedHashSet<>(allListeners);
 				retriever.applicationListenerBeans = filteredListenerBeans;
 			}
 			else {
+				// 如果有 Prototype Bean，只能分开缓存
 				retriever.applicationListeners = filteredListeners;
 				retriever.applicationListenerBeans = filteredListenerBeans;
 			}
 		}
+
 		return allListeners;
 	}
 
@@ -393,8 +447,14 @@ public abstract class AbstractApplicationEventMulticaster
 	protected boolean supportsEvent(
 			ApplicationListener<?> listener, ResolvableType eventType, @Nullable Class<?> sourceType) {
 
+		// 1. 包装为 GenericApplicationListener
+		// 如果你的监听器只是普通的 ApplicationListener，这里会被包装成 GenericApplicationListenerAdapter
 		GenericApplicationListener smartListener = (listener instanceof GenericApplicationListener gal ? gal :
 				new GenericApplicationListenerAdapter(listener));
+		// 2. 检查是否支持该【事件类型】
+		// (例如：你监听的是 ContextRefreshedEvent，当前发的是 ContextClosedEvent，这里就返回 false)
+		// 3. 检查是否支持该【事件源类型】
+		// (例如：你只想监听来自 WebContext 的刷新事件，不想要普通 Context 的，很少用，但支持)
 		return (smartListener.supportsEventType(eventType) && smartListener.supportsSourceType(sourceType));
 	}
 
@@ -447,7 +507,6 @@ public abstract class AbstractApplicationEventMulticaster
 		}
 	}
 
-
 	/**
 	 * Helper class that encapsulates a specific set of target listeners,
 	 * allowing for efficient retrieval of pre-filtered listeners.
@@ -488,7 +547,6 @@ public abstract class AbstractApplicationEventMulticaster
 			return allListeners;
 		}
 	}
-
 
 	/**
 	 * Helper class that encapsulates a general set of target listeners.

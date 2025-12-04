@@ -135,19 +135,48 @@ public class SimpleApplicationEventMulticaster extends AbstractApplicationEventM
 
 	@Override
 	public void multicastEvent(ApplicationEvent event, @Nullable ResolvableType eventType) {
+		// 1. 解析事件类型
+		// ResolvableType 是 Spring 的泛型封装工具。
+		// 如果调用方没传类型，就从 event 实例本身解析。这个类型将用于后续过滤监听器。
 		ResolvableType type = (eventType != null ? eventType : ResolvableType.forInstance(event));
+
+		// 2. 获取任务执行器 (Executor)
+		// 这是判断是否“异步广播”的第一要素。
+		// 默认情况下它是 null（即同步广播）。如果你手动给 Multicaster 设置了线程池，这里就不为 null。
 		Executor executor = getTaskExecutor();
+
+		// 3. 【核心路由】查找匹配的监听器
+		// getApplicationListeners 负责去通讯录（ListenerRegistry）里查。
+		// 它会根据事件类型 (type) 筛选出所有关注该事件的监听器 (Observer)。
+		// 这个方法内部有很强的缓存机制 (ListenerRetriever)，第一次匹配慢，后面都很快。
 		for (ApplicationListener<?> listener : getApplicationListeners(event, type)) {
+
+			// 4. 决策：同步执行还是异步执行？
+			// 要满足两个条件才能异步：
+			// A. 必须配置了线程池 (executor != null)。
+			// B. 监听器本身必须支持异步 (listener.supportsAsyncExecution())。
+			//    (注：supportsAsyncExecution 是 Spring 6.1+ 新增的接口方法，默认返回 true，
+			//     但这允许某些特殊的监听器强制要求同步执行，即使配置了线程池。)
 			if (executor != null && listener.supportsAsyncExecution()) {
 				try {
+					// 5. 【异步分支】
+					// 将任务提交给线程池。
+					// 此时，发布事件的主线程（业务线程）不会阻塞，会立即继续循环或返回。
 					executor.execute(() -> invokeListener(listener, event));
 				}
 				catch (RejectedExecutionException ex) {
 					// Probably on shutdown -> invoke listener locally instead
+					// 6. 容错降级 (Fallback)
+					// 如果线程池满了（抛出 RejectedExecutionException），或者正在关闭，
+					// 为了保证事件肯定能送达，这里会“降级”为由当前线程同步执行。
 					invokeListener(listener, event);
 				}
 			}
 			else {
+				// 7. 【同步分支】(默认情况)
+				// 没有配置线程池，或者监听器强制要求同步。
+				// 直接在当前线程调用 invokeListener。
+				// 这意味着：publishEvent() 方法会阻塞，直到所有同步监听器都执行完毕。
 				invokeListener(listener, event);
 			}
 		}
@@ -160,6 +189,7 @@ public class SimpleApplicationEventMulticaster extends AbstractApplicationEventM
 	 * @since 4.1
 	 */
 	protected void invokeListener(ApplicationListener<?> listener, ApplicationEvent event) {
+		// 处理异常的一层包装，防止监听器报错导致整个流程中断
 		ErrorHandler errorHandler = getErrorHandler();
 		if (errorHandler != null) {
 			try {
@@ -177,6 +207,7 @@ public class SimpleApplicationEventMulticaster extends AbstractApplicationEventM
 	@SuppressWarnings({"rawtypes", "unchecked"})
 	private void doInvokeListener(ApplicationListener listener, ApplicationEvent event) {
 		try {
+			// 【最终调用】直接调用接口方法
 			listener.onApplicationEvent(event);
 		}
 		catch (ClassCastException ex) {

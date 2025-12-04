@@ -256,3 +256,66 @@ This document outlines the execution order of the Spring Framework startup proce
 - [Line 267](spring-webmvc/src/main/java/org/springframework/web/servlet/config/annotation/WebMvcConfigurationSupport.java#267): `// 注册 RequestMappingHandlerMapping (处理 @RequestMapping)`
 - [Line 514](spring-webmvc/src/main/java/org/springframework/web/servlet/config/annotation/WebMvcConfigurationSupport.java#514): `// 【关键】注入拦截器 (调用 getInterceptors -> addInterceptors)`
 - [Line 650](spring-webmvc/src/main/java/org/springframework/web/servlet/config/annotation/WebMvcConfigurationSupport.java#650): `// 注册 RequestMappingHandlerAdapter (调用 Controller 方法)`
+
+## 16. Spring 事件机制 (Event Mechanism)
+
+### 总结 Spring 事件机制流程 (Summary)
+
+**1. 准备 (Preparation):**
+容器启动时，在 `refresh()` 的第 8 步初始化 `SimpleApplicationEventMulticaster`。
+**Location:** `spring-context/AbstractApplicationContext.java`
+- [Line 875](spring-context/src/main/java/org/springframework/context/support/AbstractApplicationContext.java#875): `// 2. 如果没配置，就新建一个默认的 SimpleApplicationEventMulticaster`
+
+**2. 发布 (Publishing):**
+业务代码调用 `ctx.publishEvent(new OrderSuccessEvent())`。
+**Location:** `spring-context/AbstractApplicationContext.java`
+- [Line 445](spring-context/src/main/java/org/springframework/context/support/AbstractApplicationContext.java#445): `// 2. 【核心】交给广播器去广播`
+- [Line 447](spring-context/src/main/java/org/springframework/context/support/AbstractApplicationContext.java#447): `// 如果容器还没启动完，先存起来，等启动完了再发`
+- [Line 944](spring-context/src/main/java/org/springframework/context/support/AbstractApplicationContext.java#944): `// 【关键】将 earlyApplicationEvents 置为 null`
+
+**3. 路由 (Routing):**
+Multicaster 根据事件类型（OrderSuccessEvent），过滤出所有监听这个类型的 Listener。
+**Location:** `spring-context/SimpleApplicationEventMulticaster.java`
+- [Line 138](spring-context/src/main/java/org/springframework/context/event/SimpleApplicationEventMulticaster.java#138): `// 1. 解析事件类型`
+- [Line 148](spring-context/src/main/java/org/springframework/context/event/SimpleApplicationEventMulticaster.java#148): `// 3. 【核心路由】查找匹配的监听器`
+
+### 监听器匹配流程详解 (Listener Matching Process)
+**Location:** `spring-context/AbstractApplicationEventMulticaster.java`
+
+**匹配流程图:**
+1.  **查缓存**: 用 `OrderSuccessEvent.class` + `SourceType` 做 Key 去 Map 里找。
+    *   **有?** -> 直接拿走 List，结束。
+    *   **无?** -> 进入下一步。
+2.  **遍历 Bean**: 拿到容器里所有的 `ApplicationListener` Bean。
+3.  **逐个面试 (Type Matching)**:
+    *   Spring 问监听器 A：“你监听什么类型？” -> A 说：“我监听 `ApplicationEvent` (所有事件)。” -> **匹配成功**。
+    *   Spring 问监听器 B：“你监听什么类型？” -> B 说：“我监听 `OrderSuccessEvent`。” -> **匹配成功**。
+    *   Spring 问监听器 C：“你监听什么类型？” -> C 说：“我监听 `UserRegisterEvent`。” -> **匹配失败**。
+4.  **泛型检查 (Generic Matching)**:
+    *   Spring 问监听器 D：“你监听什么？” -> D 说：“我监听 `OrderEvent<VipUser>`。”
+    *   Spring 检查当前事件：“哦，当前的 `OrderSuccessEvent` 泛型是 `NormalUser`。” -> **匹配失败**。
+5.  **存缓存**: 把 A 和 B 放入缓存。下次再发这个事件，直接通知 A 和 B。
+
+- [Line 188](spring-context/src/main/java/org/springframework/context/event/AbstractApplicationEventMulticaster.java#188): `// getApplicationListeners: 获取匹配的监听器入口`
+- [Line 201](spring-context/src/main/java/org/springframework/context/event/AbstractApplicationEventMulticaster.java#201): `// 1. 查缓存 (retrieverCache)`
+- [Line 236](spring-context/src/main/java/org/springframework/context/event/AbstractApplicationEventMulticaster.java#236): `// 2. 实际查找 (retrieveApplicationListeners)`
+- [Line 252](spring-context/src/main/java/org/springframework/context/event/AbstractApplicationEventMulticaster.java#252): `// 3. 遍历编程式注册的监听器`
+- [Line 267](spring-context/src/main/java/org/springframework/context/event/AbstractApplicationEventMulticaster.java#267): `// 4. 遍历 Bean 名称注册的监听器`
+- [Line 359](spring-context/src/main/java/org/springframework/context/event/AbstractApplicationEventMulticaster.java#359): `// 5. 泛型检查 (Generic Type Check)`
+
+**4. 调度 (Scheduling):**
+- **异步 (Async):** 如果有 Executor，丢给线程池。
+- **同步 (Sync):** 如果没有（默认），直接在当前线程循环调用。
+**Location:** `spring-context/SimpleApplicationEventMulticaster.java`
+- [Line 143](spring-context/src/main/java/org/springframework/context/event/SimpleApplicationEventMulticaster.java#143): `// 2. 获取任务执行器 (Executor)`
+- [Line 154](spring-context/src/main/java/org/springframework/context/event/SimpleApplicationEventMulticaster.java#154): `// 4. 决策：同步执行还是异步执行？`
+- [Line 162](spring-context/src/main/java/org/springframework/context/event/SimpleApplicationEventMulticaster.java#162): `// 5. 【异步分支】`
+- [Line 176](spring-context/src/main/java/org/springframework/context/event/SimpleApplicationEventMulticaster.java#176): `// 7. 【同步分支】(默认情况)`
+
+**5. 执行 (Execution):**
+调用 `listener.onApplicationEvent(event)`。
+**Location:** `spring-context/SimpleApplicationEventMulticaster.java`
+- [Line 210](spring-context/src/main/java/org/springframework/context/event/SimpleApplicationEventMulticaster.java#210): `// 【最终调用】直接调用接口方法`
+
+> [!NOTE]
+> 这个机制非常解耦，Spring 内部大量使用它来处理生命周期（如 ContextRefreshed），Spring Cloud 也大量使用它来处理配置刷新（RefreshEvent）。

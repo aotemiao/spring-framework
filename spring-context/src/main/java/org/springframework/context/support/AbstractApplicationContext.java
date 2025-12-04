@@ -415,11 +415,13 @@ public abstract class AbstractApplicationContext extends DefaultResourceLoader
 		ResolvableType eventType = null;
 
 		// Decorate event as an ApplicationEvent if necessary
+		// 1. 适配 Event
 		ApplicationEvent applicationEvent;
 		if (event instanceof ApplicationEvent applEvent) {
 			applicationEvent = applEvent;
 			eventType = typeHint;
 		}
+		// 如果你发布的不是 ApplicationEvent 子类（只是个普通 Object），Spring 会把它包装成 PayloadApplicationEvent
 		else {
 			ResolvableType payloadType = null;
 			if (typeHint != null && ApplicationEvent.class.isAssignableFrom(typeHint.toClass())) {
@@ -440,14 +442,18 @@ public abstract class AbstractApplicationContext extends DefaultResourceLoader
 		}
 
 		// Multicast right now if possible - or lazily once the multicaster is initialized
+		// 2. 【核心】交给广播器去广播
 		if (this.earlyApplicationEvents != null) {
+			// 如果容器还没启动完，先存起来，等启动完了再发
 			this.earlyApplicationEvents.add(applicationEvent);
 		}
 		else if (this.applicationEventMulticaster != null) {
+			// 容器已就绪，立即广播
 			this.applicationEventMulticaster.multicastEvent(applicationEvent, eventType);
 		}
 
 		// Publish event via parent context as well...
+		// 3. 如果父容器存在，也要通知父容器
 		if (this.parent != null) {
 			if (this.parent instanceof AbstractApplicationContext abstractApplicationContext) {
 				abstractApplicationContext.publishEvent(event, typeHint);
@@ -702,6 +708,7 @@ public abstract class AbstractApplicationContext extends DefaultResourceLoader
 
 		// Allow for the collection of early ApplicationEvents,
 		// to be published once the multicaster is available...
+		// 当容器开始刷新时，会创建一个集合用来存放早期事件
 		this.earlyApplicationEvents = new LinkedHashSet<>();
 	}
 
@@ -856,6 +863,7 @@ public abstract class AbstractApplicationContext extends DefaultResourceLoader
 	 */
 	protected void initApplicationEventMulticaster() {
 		ConfigurableListableBeanFactory beanFactory = getBeanFactory();
+		// 1. 检查用户有没有自定义广播器 (Bean名字必须叫 "applicationEventMulticaster")
 		if (beanFactory.containsLocalBean(APPLICATION_EVENT_MULTICASTER_BEAN_NAME)) {
 			this.applicationEventMulticaster =
 					beanFactory.getBean(APPLICATION_EVENT_MULTICASTER_BEAN_NAME, ApplicationEventMulticaster.class);
@@ -864,6 +872,8 @@ public abstract class AbstractApplicationContext extends DefaultResourceLoader
 			}
 		}
 		else {
+			// 2. 如果没配置，就新建一个默认的 SimpleApplicationEventMulticaster
+			// 这是 Spring 事件机制的标准实现
 			this.applicationEventMulticaster = new SimpleApplicationEventMulticaster(beanFactory);
 			beanFactory.registerSingleton(APPLICATION_EVENT_MULTICASTER_BEAN_NAME, this.applicationEventMulticaster);
 			if (logger.isTraceEnabled()) {
@@ -929,8 +939,12 @@ public abstract class AbstractApplicationContext extends DefaultResourceLoader
 		}
 
 		// Publish early application events now that we finally have a multicaster...
+		// 获取刚才暂存的所有早期事件
 		Set<ApplicationEvent> earlyEventsToProcess = this.earlyApplicationEvents;
+		// 【关键】将 earlyApplicationEvents 置为 null
+		// 这意味着从此以后，再调用 publishEvent 就会直接走 else if (multicaster != null) 的分支，直接广播
 		this.earlyApplicationEvents = null;
+		// 如果有暂存的事件，现在统一广播出去
 		if (!CollectionUtils.isEmpty(earlyEventsToProcess)) {
 			for (ApplicationEvent earlyEvent : earlyEventsToProcess) {
 				getApplicationEventMulticaster().multicastEvent(earlyEvent);
