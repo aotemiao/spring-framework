@@ -732,12 +732,14 @@ public abstract class AbstractPlatformTransactionManager
 	 */
 	@Override
 	public final void commit(TransactionStatus status) throws TransactionException {
+		// 如果事务已经完成，则抛出异常，防止重复提交或回滚
 		if (status.isCompleted()) {
 			throw new IllegalTransactionStateException(
 					"Transaction is already completed - do not call commit or rollback more than once per transaction");
 		}
 
 		DefaultTransactionStatus defStatus = (DefaultTransactionStatus) status;
+		// 如果事务被标记为本地仅回滚（例如代码中显式调用了 setRollbackOnly()），则执行回滚操作而不提交
 		if (defStatus.isLocalRollbackOnly()) {
 			if (defStatus.isDebug()) {
 				logger.debug("Transactional code has requested rollback");
@@ -746,6 +748,8 @@ public abstract class AbstractPlatformTransactionManager
 			return;
 		}
 
+		// 如果全局事务被标记为仅回滚（例如因为参与的内部事务失败导致），且配置为不在全局仅回滚时提交（默认情况），则执行回滚
+		// 这里的 true 参数表示这是一个非预期的回滚（unexpected）
 		if (!shouldCommitOnGlobalRollbackOnly() && defStatus.isGlobalRollbackOnly()) {
 			if (defStatus.isDebug()) {
 				logger.debug("Global transaction is marked as rollback-only but transactional code requested commit");
@@ -754,6 +758,7 @@ public abstract class AbstractPlatformTransactionManager
 			return;
 		}
 
+		// 一切正常，执行实际的提交逻辑
 		processCommit(defStatus);
 	}
 
@@ -770,20 +775,27 @@ public abstract class AbstractPlatformTransactionManager
 
 			try {
 				boolean unexpectedRollback = false;
+				// 1. 准备提交：例如对于 Hibernate 可能是执行 session.flush() 将缓存写入数据库
 				prepareForCommit(status);
+				// 2. 触发 beforeCommit 回调：例如验证只读事务
 				triggerBeforeCommit(status);
+				// 3. 触发 beforeCompletion 回调：事务完成前的最后一步操作
 				triggerBeforeCompletion(status);
 				beforeCompletionInvoked = true;
 
+				// 4. 处理嵌套事务（Savepoint）
 				if (status.hasSavepoint()) {
 					if (status.isDebug()) {
 						logger.debug("Releasing transaction savepoint");
 					}
 					unexpectedRollback = status.isGlobalRollbackOnly();
+					// 触发监听器的 beforeCommit
 					this.transactionExecutionListeners.forEach(listener -> listener.beforeCommit(status));
 					commitListenerInvoked = true;
+					// 释放保存点（注意：对于 JDBC 来说，释放保存点意味着接纳这部分变更，但真正的提交取决于最外层事务）
 					status.releaseHeldSavepoint();
 				}
+				// 5. 处理新事务（最外层事务）
 				else if (status.isNewTransaction()) {
 					if (status.isDebug()) {
 						logger.debug("Initiating transaction commit");
@@ -791,29 +803,37 @@ public abstract class AbstractPlatformTransactionManager
 					unexpectedRollback = status.isGlobalRollbackOnly();
 					this.transactionExecutionListeners.forEach(listener -> listener.beforeCommit(status));
 					commitListenerInvoked = true;
+					// 执行真正的底层提交操作（例如 JDBC 的 connection.commit()）
 					doCommit(status);
 				}
+				// 6. 处理参与已有事务的情况
 				else if (isFailEarlyOnGlobalRollbackOnly()) {
 					unexpectedRollback = status.isGlobalRollbackOnly();
 				}
 
 				// Throw UnexpectedRollbackException if we have a global rollback-only
 				// marker but still didn't get a corresponding exception from commit.
+				// 7. 检查是否发生意外回滚：如果事务被标记为“仅回滚”，但代码流程却走到了提交这一步
+				// (且没有在 doCommit 中抛出异常)，则必须抛出 UnexpectedRollbackException 通知调用者
 				if (unexpectedRollback) {
 					throw new UnexpectedRollbackException(
 							"Transaction silently rolled back because it has been marked as rollback-only");
 				}
 			}
 			catch (UnexpectedRollbackException ex) {
+				// 处理意外回滚异常：触发完成回调（状态为 ROLLED_BACK）
 				triggerAfterCompletion(status, TransactionSynchronization.STATUS_ROLLED_BACK);
 				this.transactionExecutionListeners.forEach(listener -> listener.afterRollback(status, null));
 				throw ex;
 			}
 			catch (TransactionException ex) {
+				// 处理提交时的事务异常
 				if (isRollbackOnCommitFailure()) {
+					// 如果配置了提交失败时回滚，则执行回滚
 					doRollbackOnCommitException(status, ex);
 				}
 				else {
+					// 否则标记状态为 UNKNOWN
 					triggerAfterCompletion(status, TransactionSynchronization.STATUS_UNKNOWN);
 					if (commitListenerInvoked) {
 						this.transactionExecutionListeners.forEach(listener -> listener.afterCommit(status, ex));
@@ -822,9 +842,11 @@ public abstract class AbstractPlatformTransactionManager
 				throw ex;
 			}
 			catch (RuntimeException | Error ex) {
+				// 处理其他运行时异常：如果在 beforeCompletion 之前就挂了，补调一次
 				if (!beforeCompletionInvoked) {
 					triggerBeforeCompletion(status);
 				}
+				// 执行回滚处理
 				doRollbackOnCommitException(status, ex);
 				throw ex;
 			}
@@ -832,9 +854,11 @@ public abstract class AbstractPlatformTransactionManager
 			// Trigger afterCommit callbacks, with an exception thrown there
 			// propagated to callers but the transaction still considered as committed.
 			try {
+				// 8. 触发 afterCommit 回调
 				triggerAfterCommit(status);
 			}
 			finally {
+				// 9. 触发 afterCompletion 回调（状态为 COMMITTED）
 				triggerAfterCompletion(status, TransactionSynchronization.STATUS_COMMITTED);
 				if (commitListenerInvoked) {
 					this.transactionExecutionListeners.forEach(listener -> listener.afterCommit(status, null));
@@ -843,6 +867,7 @@ public abstract class AbstractPlatformTransactionManager
 
 		}
 		finally {
+			// 10. 最后的清理工作：解绑线程资源、重置连接属性等
 			cleanupAfterCompletion(status);
 		}
 	}
@@ -1053,18 +1078,24 @@ public abstract class AbstractPlatformTransactionManager
 	 * @see #doCleanupAfterCompletion
 	 */
 	private void cleanupAfterCompletion(DefaultTransactionStatus status) {
+		// 1. 标记事务已完成
 		status.setCompleted();
+		// 2. 【关键】清理与当前线程绑定的资源
 		if (status.isNewSynchronization()) {
 			TransactionSynchronizationManager.clear();
 		}
+		// 3. 【关键】调用子类的清理逻辑 (进入 DataSourceTransactionManager)
 		if (status.isNewTransaction()) {
 			doCleanupAfterCompletion(status.getTransaction());
 		}
+		// 4. 恢复挂起的事务
+		// 如果在事务开始前有挂起的资源（例如因为 REQUIRES_NEW 挂起了外层事务），现在内层事务结束了，需要恢复外层事务
 		if (status.getSuspendedResources() != null) {
 			if (status.isDebug()) {
 				logger.debug("Resuming suspended transaction after completion of inner transaction");
 			}
 			Object transaction = (status.hasTransaction() ? status.getTransaction() : null);
+			// 恢复挂起的事务资源和同步状态，使外层事务继续执行
 			resume(transaction, (SuspendedResourcesHolder) status.getSuspendedResources());
 		}
 	}

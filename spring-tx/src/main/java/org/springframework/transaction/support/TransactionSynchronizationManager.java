@@ -74,21 +74,31 @@ import org.springframework.util.Assert;
  */
 public abstract class TransactionSynchronizationManager {
 
+	// 1. 【资源绑定】最重要的一个！
+	// 这里的 Key 通常是 DataSource 对象，Value 是 ConnectionHolder (封装了数据库连接)
+	// 它的作用是：在当前线程中，把【数据库连接】和【数据源】绑定在一起。
 	private static final ThreadLocal<Map<Object, Object>> resources =
 			new NamedThreadLocal<>("Transactional resources");
 
+	// 2. 【同步器】
+	// 存储注册的事务监听回调（比如 TransactionalEventListener 就是在这里被触发的）
 	private static final ThreadLocal<Set<TransactionSynchronization>> synchronizations =
 			new NamedThreadLocal<>("Transaction synchronizations");
 
+	// 3. 【事务属性】
+	// 记录当前事务的名字
 	private static final ThreadLocal<String> currentTransactionName =
 			new NamedThreadLocal<>("Current transaction name");
 
+	// 只读状态
 	private static final ThreadLocal<Boolean> currentTransactionReadOnly =
 			new NamedThreadLocal<>("Current transaction read-only status");
 
+	// 隔离级别
 	private static final ThreadLocal<Integer> currentTransactionIsolationLevel =
 			new NamedThreadLocal<>("Current transaction isolation level");
 
+	// 激活状态
 	private static final ThreadLocal<Boolean> actualTransactionActive =
 			new NamedThreadLocal<>("Actual transaction active");
 
@@ -161,13 +171,15 @@ public abstract class TransactionSynchronizationManager {
 	 * <p><b>Note: Any bound resource needs to get explicitly unbound through
 	 * {@link #unbindResource}. For automatic unbinding after transaction
 	 * completion, use {@link #bindSynchronizedResource} instead.</b>
-	 * @param key the key to bind the value to (usually the resource factory)
+	 *
+	 * @param key   the key to bind the value to (usually the resource factory)
 	 * @param value the value to bind (usually the active resource object)
 	 * @throws IllegalStateException if there is already a value bound to the thread
 	 * @see ResourceTransactionManager#getResourceFactory()
 	 * @see #bindSynchronizedResource
 	 */
 	public static void bindResource(Object key, Object value) throws IllegalStateException {
+		// 1. 获取 DataSource
 		Object actualKey = TransactionSynchronizationUtils.unwrapResourceIfNecessary(key);
 		Object oldValue = doBindResource(actualKey, value);
 		if (oldValue != null) {
@@ -226,14 +238,20 @@ public abstract class TransactionSynchronizationManager {
 	 */
 	private static @Nullable Object doBindResource(Object actualKey, Object value) {
 		Assert.notNull(value, "Value must not be null");
+		// 1. 获取当前线程绑定的资源 Map (ThreadLocal)
 		Map<Object, Object> map = resources.get();
 		// set ThreadLocal Map if none found
+		// 2. 如果当前线程没有绑定资源 Map，则创建一个新的 HashMap 并绑定到当前线程
 		if (map == null) {
 			map = new HashMap<>();
 			resources.set(map);
 		}
+		// 3. 将实际的 key (通常是 DataSource) 和 value (通常是 ConnectionHolder) 放入 Map 中
+		// put 方法返回的是旧值（如果之前有绑定过的话）
 		Object oldValue = map.put(actualKey, value);
 		// Transparently suppress a ResourceHolder that was marked as void...
+		// 4. 如果旧值是一个 ResourceHolder 并且被标记为 void (无效)，则将其视为 null，
+		// 这通常发生在资源被释放或不再可用时，避免返回无效的资源句柄
 		if (oldValue instanceof ResourceHolder resourceHolder && resourceHolder.isVoid()) {
 			oldValue = null;
 		}
@@ -253,6 +271,8 @@ public abstract class TransactionSynchronizationManager {
 	 */
 	public static Object unbindResource(Object key) throws IllegalStateException {
 		Object actualKey = TransactionSynchronizationUtils.unwrapResourceIfNecessary(key);
+		// 1. 拿 Map (ThreadLocal.get)
+		// 2. 删 Key (Map.remove)
 		Object value = doUnbindResource(actualKey);
 		if (value == null) {
 			throw new IllegalStateException("No value for key [" + actualKey + "] bound to thread");
@@ -282,8 +302,10 @@ public abstract class TransactionSynchronizationManager {
 		if (map == null) {
 			return null;
 		}
+		// 【核心动作】从 Map 中移除
 		Object value = map.remove(actualKey);
 		// Remove entire ThreadLocal if empty...
+		// 如果 Map 空了，顺便把 ThreadLocal 也清空，防止内存泄漏
 		if (map.isEmpty()) {
 			resources.remove();
 		}

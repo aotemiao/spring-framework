@@ -183,6 +183,26 @@ This document outlines the execution order of the Spring Framework startup proce
 - [Line 336](spring-jdbc/src/main/java/org/springframework/jdbc/datasource/DataSourceTransactionManager.java#336): `// doCommit: 提交事务 (con.commit())`
 - [Line 351](spring-jdbc/src/main/java/org/springframework/jdbc/datasource/DataSourceTransactionManager.java#351): `// doRollback: 回滚事务 (con.rollback())`
 
+### 事务连接管理生命周期 (Connection Management Lifecycle)
+**Location:** `spring-tx/TransactionSynchronizationManager.java`
+
+**1. 绑定 (Binding - 事务开始):**
+事务管理器 (如 `DataSourceTransactionManager`) 在开启事务时，会获取数据库连接，并将其绑定到当前线程。
+- [Line 80](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#80): `// resources: 核心 ThreadLocal，Key 为 DataSource，Value 为 ConnectionHolder`
+- [Line 231](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#231): `// bindResource: 将连接绑定到线程`
+- [Line 237](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#237): `// doBindResource: 如果 Map 不存在则创建，放入资源`
+
+**2. 使用 (Usage - 事务进行中):**
+在事务过程中，MyBatis 或 JdbcTemplate 等工具通过 `DataSourceUtils` 获取连接时，会优先从 `TransactionSynchronizationManager` 获取已绑定的连接，从而保证同一个事务使用同一个连接。
+- [Line 112](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#112): `// getResourceMap: 获取当前线程绑定的所有资源`
+- [Line 136](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#136): `// getResource: 根据 DataSource 获取绑定的 ConnectionHolder`
+
+**3. 解绑 (Unbinding - 事务结束):**
+事务提交或回滚后，事务管理器会清理资源，解除绑定，并关闭连接（归还给连接池）。
+- [Line 257](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#257): `// unbindResource: 从当前线程移除资源`
+- [Line 284](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#284): `// doUnbindResource: 实际移除逻辑，如果 Map 空了会清理 ThreadLocal`
+- [Line 539](spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationManager.java#539): `// clear: 清除所有同步状态 (包括事务名、只读状态、隔离级别等)`
+
 ## 14. Spring MVC 请求处理 (Request Processing)
 
 ### 核心处理流程 (RequestResponseBodyMethodProcessor)
